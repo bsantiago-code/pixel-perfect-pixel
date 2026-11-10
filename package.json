@@ -15,7 +15,8 @@
     "db:setup": "node --env-file=.env.local scripts/db-setup.mjs",
     "dev:api": "node --watch --env-file=.env.local --import tsx server/index.ts",
     "start:api": "tsx --env-file=.env.local server/index.ts",
-    "dev:all": "concurrently -k -n api,web -c blue,green \"npm:dev:api\" \"npm:dev\"",
+    "predev:all": "node scripts/ensure-deps.mjs",
+    "dev:all":"concurrently -k -n api,web -c blue,green \"npm:dev:api\" \"npm:dev\"",
     "lint": "eslint .",
     "format": "prettier --write ."
   },

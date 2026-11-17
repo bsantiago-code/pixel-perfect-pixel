@@ -18,6 +18,9 @@ comprobacionRouter.use(requireAuth);
 
 type R = Record<string, unknown>;
 
+// RFC de TRANSPORTES DE PERSONAL Y MERCANCIA: receptor obligatorio de las facturas de Caseta (cualquier sociedad).
+const RFC_CASETAS = "DCK150601XY1";
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024, files: 2 },
@@ -96,7 +99,15 @@ comprobacionRouter.post(
       }
       const soc = await one<R>("SELECT rfc FROM sociedades WHERE nombre = ?", [sol.empresa]);
       const rfcMatch = text.match(/Receptor[^>]*Rfc=["']([^"']+)["']/i);
-      if (rfcMatch && soc && String(rfcMatch[1]).toUpperCase() !== String(soc.rfc).toUpperCase()) {
+      // Las casetas siempre se facturan a TRANSPORTES DE PERSONAL Y MERCANCIA (DCK150601XY1), sea cual sea la
+      // sociedad de la solicitud; el resto de los conceptos van a la sociedad de la solicitud.
+      if (reng.concepto === "Caseta") {
+        if (rfcMatch && String(rfcMatch[1]).toUpperCase() !== RFC_CASETAS) {
+          throw bad(
+            `Las casetas se facturan a TRANSPORTES DE PERSONAL Y MERCANCIA (${RFC_CASETAS}); el RFC del receptor del XML no coincide. No se guardó el comprobante.`,
+          );
+        }
+      } else if (rfcMatch && soc && String(rfcMatch[1]).toUpperCase() !== String(soc.rfc).toUpperCase()) {
         throw bad(`El RFC del receptor del XML no coincide con la sociedad (${soc.rfc}). No se guardó el comprobante.`);
       }
       const v = validarContenidoFactura(text, await cargarListasProhibidas());

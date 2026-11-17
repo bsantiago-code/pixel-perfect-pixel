@@ -9,7 +9,15 @@ import {
 import { hashPassword, me, requireAuth, requirePerm, toAuthUser } from "../auth.ts";
 import { exec, newId, one, rows, tx } from "../db.ts";
 import { bad, forbidden, HttpError, notFound } from "../http.ts";
+import { cifrarSecreto } from "../secretos.ts";
 import { correoOut, hotelOut, logOut, sociedadOut } from "../mappers.ts";
+import {
+  cargarSmtp,
+  CorreoError,
+  enviarCorreo,
+  limpiarNombre,
+  type SmtpCfg,
+} from "../services/correo.ts";
 import { listPrealtas } from "./auth.ts";
 
 export const adminRouter = Router();
@@ -41,11 +49,17 @@ export async function loadConfig(): Promise<Record<string, unknown>> {
   return cfg;
 }
 
-adminRouter.get("/config", async (req, res) => {
+/** Configuración para el navegador: la contraseña SMTP (cifrada en BD) nunca sale; solo si hay una guardada. */
+async function configPublica(): Promise<Record<string, unknown>> {
   const cfg = await loadConfig();
-  // La contraseña SMTP solo la ve quien administra montos/configuración.
-  if (!me(req).role.permisos.configurar_montos) delete cfg.smtp_password;
-  res.json(cfg);
+  const guardada = typeof cfg.smtp_password === "string" && cfg.smtp_password !== "";
+  delete cfg.smtp_password;
+  cfg.smtp_password_configurada = guardada;
+  return cfg;
+}
+
+adminRouter.get("/config", async (_req, res) => {
+  res.json(await configPublica());
 });
 
 // Palabras prohibidas en facturas (alcohol, tabaco, higiene). Si la clave aún no existe en la BD se usan las de código.
@@ -70,7 +84,7 @@ const CONFIG_KEYS = new Set([
   "monto_comida_diario", "umbral_finanzas", "dia_deposito", "email_compras",
   "dias_comprobacion_atrasada", "dias_autorizacion_pendiente", "dias_recordatorio_viaje",
   "notif_email_activo", "notif_email_destinatarios", "smtp_servidor", "smtp_puerto", "smtp_usuario",
-  "smtp_password", "smtp_cifrado", "notif_plataforma_activo", "revision_automatica_activo",
+  "smtp_password", "smtp_cifrado", "smtp_remitente", "notif_plataforma_activo", "revision_automatica_activo",
   "bloquear_folio_monto_hotel", ...Object.keys(LISTAS_KEYS),
 ]);
 
@@ -82,7 +96,18 @@ adminRouter.put("/config", requirePerm("configurar_montos"), async (req, res) =>
     for (const [k, v] of Object.entries(body)) {
       if (!CONFIG_KEYS.has(k)) continue;
       if (k in LISTAS_KEYS && !Array.isArray(v)) throw bad("Las palabras prohibidas deben ser una lista de textos.");
-      const valor = k in LISTAS_KEYS ? normalizarListaPalabras(v) : v;
+      if (k === "smtp_password") {
+        if (typeof v !== "string") throw bad("La contraseña SMTP debe ser texto.");
+        if (v === "") continue; // vacío = conservar la guardada
+      }
+      const valor =
+        k in LISTAS_KEYS
+          ? normalizarListaPalabras(v)
+          : k === "smtp_remitente"
+            ? limpiarNombre(v)
+            : k === "smtp_password"
+              ? cifrarSecreto(v as string) // AES-256-GCM: nunca se guarda en claro
+              : v;
       await exec(
         "INSERT INTO configuracion (clave, valor) VALUES (?, CAST(? AS JSON)) ON DUPLICATE KEY UPDATE valor = VALUES(valor)",
         [k, JSON.stringify(valor)],
@@ -99,8 +124,55 @@ adminRouter.put("/config", requirePerm("configurar_montos"), async (req, res) =>
       ]);
     }
   }, auth.user.id);
-  const cfg = await loadConfig();
-  res.json(cfg);
+  res.json(await configPublica());
+});
+
+// Envía un correo de prueba con los valores del formulario (no hace falta guardar antes); si la contraseña
+// viene vacía se usa la guardada. Por omisión va al correo del administrador en sesión.
+adminRouter.post("/config/probar-correo", requirePerm("configurar_montos"), async (req, res) => {
+  const b = z
+    .object({
+      para: z.string().trim().email("El correo de destino no es válido.").optional(),
+      smtp_servidor: z.string().optional(),
+      smtp_puerto: z.coerce.number().int().min(1).max(65535).optional(),
+      smtp_usuario: z.string().optional(),
+      smtp_password: z.string().optional(),
+      smtp_cifrado: z.string().optional(),
+      smtp_remitente: z.string().optional(),
+    })
+    .parse(req.body);
+  let g: SmtpCfg;
+  try {
+    // Si la guardada ya no se puede descifrar pero el formulario trae una nueva, se prueba con la nueva.
+    g = await cargarSmtp({ ignorarPassword: !!b.smtp_password });
+  } catch (e) {
+    if (e instanceof CorreoError) throw new HttpError(e.status, e.message);
+    throw e;
+  }
+  const cfg: SmtpCfg = {
+    servidor: (b.smtp_servidor ?? g.servidor).trim(),
+    puerto: b.smtp_puerto ?? g.puerto,
+    usuario: (b.smtp_usuario ?? g.usuario).trim(),
+    password: b.smtp_password || g.password,
+    cifrado: b.smtp_cifrado || g.cifrado,
+    remitente: limpiarNombre(b.smtp_remitente ?? g.remitente),
+  };
+  const para = b.para ?? me(req).user.correo;
+  try {
+    const r = await enviarCorreo(
+      {
+        para,
+        asunto: "Correo de prueba — Portal de Viáticos CKL",
+        cuerpo:
+          "Este es un correo de prueba del Portal de Viáticos CKL.\n\nSi lo recibes, la configuración SMTP funciona correctamente.",
+      },
+      cfg,
+    );
+    res.json({ ok: true, para, remitente: r.remitente });
+  } catch (e) {
+    if (e instanceof CorreoError) throw new HttpError(e.status, e.message);
+    throw e;
+  }
 });
 
 // ───────── sociedades ─────────

@@ -41,6 +41,14 @@ export const Route = createFileRoute("/_portal/configuracion")({
   component: Configuracion,
 });
 
+const ESTADO_CORREO: Record<string, string> = {
+  simulado: "Simulado (sin servidor SMTP)",
+  omitido: "Omitido (correos desactivados)",
+  pendiente: "Enviando…",
+  enviado: "Enviado",
+  error: "Error al enviar",
+};
+
 // Lista editable de palabras (chips): se agregan con Enter o el botón y se quitan con la X.
 function ListaPalabras({
   titulo,
@@ -143,7 +151,7 @@ function BitacoraNotificaciones() {
                 <td className="whitespace-nowrap p-2">{fh(c.fecha)}</td>
                 <td className="p-2">{c.para}</td>
                 <td className="p-2">{c.asunto}</td>
-                <td className="p-2">{c.estado}</td>
+                <td className="p-2">{ESTADO_CORREO[c.estado] ?? c.estado}</td>
               </tr>
             ))}
             {correos.length === 0 && (
@@ -194,8 +202,14 @@ function BitacoraNotificaciones() {
         <Modal onClose={() => setCorreo(null)}>
           <h3 className="pr-6 text-base font-semibold">{correo.asunto}</h3>
           <div className="mt-1 text-xs text-muted-foreground">
-            Para: {correo.para} · {fh(correo.fecha)} · {correo.estado}
+            {correo.remitente ? `De: ${correo.remitente} · ` : ""}Para: {correo.para} · {fh(correo.fecha)} ·{" "}
+            {ESTADO_CORREO[correo.estado] ?? correo.estado}
           </div>
+          {correo.estado === "error" && correo.detalle_error && (
+            <div className="mt-2 rounded-md border border-red-200 bg-red-50 p-2 text-xs text-red-700">
+              {correo.detalle_error}
+            </div>
+          )}
           <pre className="mt-3 whitespace-pre-wrap rounded-md bg-secondary p-3 text-xs">{correo.cuerpo}</pre>
         </Modal>
       )}
@@ -219,6 +233,19 @@ function Configuracion() {
   const guardarCfg = useApiMutation((c: Config) => api.put("/config", { ...c, smtp_password: c.smtp_password || undefined }), {
     onSuccess: () => toast.success("Configuración guardada."),
   });
+  // Envía un correo real con los valores del formulario (sin necesidad de guardar antes).
+  const probarCorreo = useApiMutation(
+    (c: Config) =>
+      api.post<{ ok: boolean; para: string; remitente: string }>("/config/probar-correo", {
+        smtp_servidor: c.smtp_servidor,
+        smtp_puerto: c.smtp_puerto,
+        smtp_usuario: c.smtp_usuario,
+        smtp_password: c.smtp_password || undefined,
+        smtp_cifrado: c.smtp_cifrado,
+        smtp_remitente: c.smtp_remitente,
+      }),
+    { onSuccess: (r) => toast.success(`Correo de prueba enviado a ${r.para} como "${r.remitente}".`) },
+  );
   const guardarSoc = useApiMutation(
     (s: Sociedad) => (s.id === 0 ? api.post("/sociedades", s) : api.put(`/sociedades/${s.id}`, s)),
     {
@@ -468,10 +495,11 @@ function Configuracion() {
                 </div>
               </div>
               <button
-                onClick={() => toast.success("Correo de prueba enviado.")}
+                onClick={() => probarCorreo.mutate(draft)}
+                disabled={probarCorreo.isPending}
                 className="ckl-btn-outline shrink-0"
               >
-                <Mail size={14} /> Probar correo
+                <Mail size={14} /> {probarCorreo.isPending ? "Enviando…" : "Probar correo"}
               </button>
             </div>
             <div className="mt-3 grid gap-3 sm:grid-cols-2">
@@ -509,7 +537,28 @@ function Configuracion() {
                   className="ckl-input"
                   value={draft.smtp_password ?? ""}
                   onChange={(e) => setDraft({ ...draft, smtp_password: e.target.value })}
+                  autoComplete="new-password"
+                  placeholder={draft.smtp_password_configurada ? "•••••••• (guardada)" : ""}
                 />
+                {draft.smtp_password_configurada && (
+                  <p className="mt-1 text-[11px] text-muted-foreground">
+                    Ya hay una contraseña guardada (cifrada). Déjalo vacío para conservarla o escribe una nueva.
+                  </p>
+                )}
+              </div>
+              <div className="sm:col-span-2">
+                <label className="ckl-label">Remitente (opcional)</label>
+                <input
+                  className="ckl-input"
+                  maxLength={100}
+                  value={draft.smtp_remitente}
+                  onChange={(e) => setDraft({ ...draft, smtp_remitente: e.target.value })}
+                  placeholder="Portal de Viáticos CKL"
+                />
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  Nombre que verá quien reciba el correo. Si lo dejas vacío se muestra solo el correo del
+                  usuario SMTP.
+                </p>
               </div>
               <div className="sm:col-span-2">
                 <label className="ckl-label">Tipo de cifrado</label>

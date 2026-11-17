@@ -46,8 +46,10 @@ export type Config = {
   smtp_servidor: string;
   smtp_puerto: number;
   smtp_usuario: string;
-  smtp_password?: string;
+  smtp_password?: string; // solo se envía al guardar; el servidor nunca la devuelve (va cifrada en BD)
+  smtp_password_configurada?: boolean; // true si ya hay una contraseña SMTP guardada
   smtp_cifrado: string;
+  smtp_remitente: string;
   notif_plataforma_activo: boolean;
   revision_automatica_activo: boolean;
   bloquear_folio_monto_hotel: boolean;
@@ -70,6 +72,7 @@ export const CONFIG_DEFAULTS: Config = {
   smtp_puerto: 587,
   smtp_usuario: "",
   smtp_cifrado: "TLS",
+  smtp_remitente: "",
   notif_plataforma_activo: true,
   revision_automatica_activo: true,
   bloquear_folio_monto_hotel: false,

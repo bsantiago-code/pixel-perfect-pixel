@@ -43,14 +43,12 @@ function safeEq(a: string, b: string) {
   return x.length === y.length && timingSafeEqual(x, y);
 }
 
-/** Acepta hash scrypt o, para los datos demo, texto plano (se re-hashea tras el primer login). */
+/** Solo acepta hashes scrypt. Cualquier valor en claro heredado lo convierte al arrancar server/seguridad.ts. */
 export async function verifyPassword(stored: string, plain: string): Promise<boolean> {
-  if (stored.startsWith("scrypt$")) {
-    const [, saltHex, hashHex] = stored.split("$");
-    const hash = await scrypt(plain, Buffer.from(saltHex, "hex"), 64);
-    return safeEq(hash.toString("hex"), hashHex);
-  }
-  return safeEq(stored, plain);
+  if (!stored.startsWith("scrypt$")) return false;
+  const [, saltHex, hashHex] = stored.split("$");
+  const hash = await scrypt(plain, Buffer.from(saltHex, "hex"), 64);
+  return safeEq(hash.toString("hex"), hashHex);
 }
 
 // ───────── usuarios / roles ─────────

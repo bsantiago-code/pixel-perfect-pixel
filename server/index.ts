@@ -10,6 +10,7 @@ import { authRouter } from "./routes/auth.ts";
 import { comprobacionRouter } from "./routes/comprobacion.ts";
 import { comprasRouter } from "./routes/compras.ts";
 import { solicitudesRouter } from "./routes/solicitudes.ts";
+import { cifrarSecretosPendientes, exigirLlave } from "./seguridad.ts";
 
 const app = express();
 app.disable("x-powered-by");
@@ -34,6 +35,14 @@ app.use("/api", () => {
 app.use(errorHandler);
 
 const port = Number(process.env.API_PORT || 3001);
-app.listen(port, "127.0.0.1", () => {
-  console.log(`API Portal de Viáticos escuchando en http://127.0.0.1:${port}`);
-});
+exigirLlave();
+cifrarSecretosPendientes()
+  .catch((e) => {
+    console.error("No se pudieron cifrar los secretos pendientes:", e);
+    process.exit(1);
+  })
+  .then(() => {
+    app.listen(port, "127.0.0.1", () => {
+      console.log(`API Portal de Viáticos escuchando en http://127.0.0.1:${port}`);
+    });
+  });

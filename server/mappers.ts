@@ -187,6 +187,8 @@ export const correoOut = (r: R) => ({
   cuerpo: r.cuerpo,
   referencia: r.referencia,
   estado: r.estado,
+  remitente: r.remitente ?? undefined,
+  detalle_error: r.detalle_error ?? undefined,
 });
 
 /** Destinos de las solicitudes indicadas, con hoteles/transportes/vales anidados (forma de DestinoStored). */

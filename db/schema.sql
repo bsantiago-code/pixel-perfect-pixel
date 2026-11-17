@@ -9,7 +9,8 @@
 --
 -- ¡ATENCIÓN! El script es re-ejecutable pero DESTRUCTIVO: borra y recrea todas las tablas
 -- de la base `portal_viaticos` y vuelve a cargar los datos de demostración.
--- Las contraseñas de los usuarios demo están en claro SOLO por ser datos de ejemplo.
+-- Las contraseñas de los usuarios demo se siembran ya con hash scrypt (los valores en claro están en PROJECT_CONTEXT.md).
+-- La contraseña SMTP se guarda cifrada (AES-256-GCM, llave APP_SECRET en .env.local) desde la pantalla de Configuración.
 --
 -- Estructura derivada de los tipos de src/lib/store.ts; los datos demo son los mismos que
 -- siembra initSeed() en localStorage.
@@ -107,7 +108,7 @@ CREATE TABLE usuarios (
   id        VARCHAR(40)  NOT NULL,
   nombre    VARCHAR(120) NOT NULL,
   correo    VARCHAR(150) NOT NULL,
-  password  VARCHAR(255) NOT NULL COMMENT 'DEMO: en claro. En producción guardar un hash.',
+  password  VARCHAR(255) NOT NULL COMMENT 'Hash scrypt (scrypt$salt$hash); nunca en claro',
   rfc       VARCHAR(20)  NOT NULL,
   rol_id    INT          NOT NULL,
   empresa   VARCHAR(120) NOT NULL,
@@ -131,7 +132,7 @@ CREATE TABLE prealtas (
   cuenta      VARCHAR(30)  NULL,
   clabe       VARCHAR(18)  NULL,
   sociedad    VARCHAR(120) NULL,
-  password    VARCHAR(255) NOT NULL COMMENT 'DEMO: en claro',
+  password    VARCHAR(255) NOT NULL COMMENT 'Hash scrypt (scrypt$salt$hash); nunca en claro',
   status      VARCHAR(20)  NOT NULL DEFAULT 'pendiente',
   created_at  DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   PRIMARY KEY (id),
@@ -141,7 +142,7 @@ CREATE TABLE prealtas (
 CREATE TABLE reset_codes (
   id          VARCHAR(40) NOT NULL,
   user_id     VARCHAR(40) NOT NULL,
-  code        VARCHAR(10) NOT NULL,
+  code        VARCHAR(64) NOT NULL COMMENT 'HMAC-SHA256 del código de 6 dígitos (el código en claro no se guarda)',
   created_at  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   used        TINYINT(1)  NOT NULL DEFAULT 0,
   PRIMARY KEY (id),
@@ -375,10 +376,13 @@ CREATE TABLE correos (
   asunto      VARCHAR(255) NOT NULL,
   cuerpo      TEXT         NOT NULL,
   referencia  VARCHAR(40)  NOT NULL DEFAULT '' COMMENT 'id de la revisión',
-  estado      ENUM('simulado','omitido') NOT NULL DEFAULT 'simulado',
+  estado      ENUM('simulado','omitido','pendiente','enviado','error') NOT NULL DEFAULT 'simulado'
+              COMMENT 'simulado: sin servidor SMTP · omitido: correos desactivados · pendiente → enviado | error',
+  remitente     VARCHAR(200) NULL COMMENT '"Nombre" <correo> con el que salió (solo enviados)',
+  detalle_error VARCHAR(500) NULL COMMENT 'motivo cuando estado = error',
   PRIMARY KEY (id),
   KEY ix_correos_referencia (referencia)
-) ENGINE=InnoDB COMMENT='Sin servidor SMTP todavía: cada correo queda registrado aquí';
+) ENGINE=InnoDB COMMENT='Cada correo del portal queda registrado aquí (envío real por SMTP o simulado)';
 
 CREATE TABLE logs (
   id          VARCHAR(40)  NOT NULL,
@@ -515,6 +519,7 @@ INSERT INTO configuracion (clave, valor) VALUES
   ('smtp_usuario', '""'),
   ('smtp_password', '""'),
   ('smtp_cifrado', '"TLS"'),
+  ('smtp_remitente', '""'),
   ('notif_plataforma_activo', 'true'),
   ('revision_automatica_activo', 'true'),
   ('bloquear_folio_monto_hotel', 'false'),
@@ -528,14 +533,14 @@ INSERT INTO folio_contador (id, ultimo) VALUES (1, 70);
 
 -- usuarios demo (contraseñas en claro SOLO por ser datos de demostración)
 INSERT INTO usuarios (id, nombre, correo, password, rfc, rol_id, empresa, jefe_id, activo, initials) VALUES
-  ('u1', 'Alonso Pérez', 'admin@cklass.com', 'Admin123!', 'PEAL800101AB1', 5, 'WATA GROUP', NULL, 1, 'AP'),
-  ('u2', 'Juan Alvarado', 'jefe@cklass.com', 'Jefe123!', 'ALAJ750505CD2', 2, 'INTERMEDIARIA INTERMEX', 'u1', 1, 'JA'),
-  ('u3', 'María Torres', 'usuario@cklass.com', 'User123!', 'TOMM900312EF3', 1, 'WATA GROUP', 'u2', 1, 'MT'),
-  ('u4', 'Luis Vega', 'finanzas@cklass.com', 'Fin123!', 'VEGAL850620GH4', 4, 'WATA GROUP', 'u1', 1, 'LV'),
-  ('u5', 'Patricia Luna', 'gestor@cklass.com', 'Gest123!', 'LUMP920718IJ5', 3, 'INTERMEDIARIA INTERMEX', 'u1', 1, 'PL'),
-  ('u6', 'Diego Ramírez', 'compras@cklass.com', 'Compras123!', 'RADI870415KL7', 6, 'WATA GROUP', 'u1', 1, 'DR'),
-  ('u7', 'Carlos Mendoza', 'usuario2@cklass.com', 'User223!', 'MECA880215MN8', 1, 'INTERMEDIARIA INTERMEX', 'u2', 1, 'CM'),
-  ('u8', 'Sofía Ramírez', 'usuario3@cklass.com', 'User323!', 'RASO910822PQ4', 1, 'TRANSPORTES DE PERSONAL Y MERCANCIA', 'u2', 1, 'SR');
+  ('u1', 'Alonso Pérez', 'admin@cklass.com', 'scrypt$c63618210704ec17666cf91bc5173558$743a4a4a45767f4146389140bc45b8c85bf8ad23e9c3496409d471dabc35fe44d9bb142841f698eec488a156f6315b0c3170bdeef8bb7683ce3b6fd65ee878cb', 'PEAL800101AB1', 5, 'WATA GROUP', NULL, 1, 'AP'),
+  ('u2', 'Juan Alvarado', 'jefe@cklass.com', 'scrypt$33a36f313681909a8d657e0c56b760be$deb68f3ccf027c20ddb6c83c546952e907d5a43172be249efe88ddc8ba7a3bef8cd7b65b423d086e490a484efca40e5e20b52a42ff931d63506adfd1b813d4c9', 'ALAJ750505CD2', 2, 'INTERMEDIARIA INTERMEX', 'u1', 1, 'JA'),
+  ('u3', 'María Torres', 'usuario@cklass.com', 'scrypt$8f0c19b686cc90219c15c0933c83946c$b84c5caf99e4e0070fa824e7e26be57679862023508a3f112297d734e70bc42945345e147bc915a20b5947c8ed5fb3d70aaa7b69e6fda0687477e037d2682e21', 'TOMM900312EF3', 1, 'WATA GROUP', 'u2', 1, 'MT'),
+  ('u4', 'Luis Vega', 'finanzas@cklass.com', 'scrypt$8689890a9fc244b6eb3f503ebae38a29$e6231c2d934389704a1c47444a0e99859ef1176a177c106eb5e64b100b328796fa46bf5a1bfa4e8aef8576856b77fe66f8c8c76ece1fd7c056affb8dd5c68e3b', 'VEGAL850620GH4', 4, 'WATA GROUP', 'u1', 1, 'LV'),
+  ('u5', 'Patricia Luna', 'gestor@cklass.com', 'scrypt$4721c15f970db03163e65982e94c789f$e3cd3126533dfef54459709a72ee8087ee52f25f82867f41b95efd734b3c902ea61521ed2b89552d84bcb45fdc5d271a38631ab2d90e904da7e55a98c4cc37f3', 'LUMP920718IJ5', 3, 'INTERMEDIARIA INTERMEX', 'u1', 1, 'PL'),
+  ('u6', 'Diego Ramírez', 'compras@cklass.com', 'scrypt$011a881139319900e942e773a4700944$552efb9d45d76031615ea80d60dc3eea092e1ed3efe20caf452cd91c2d0b9b5f4dd587cd0797dd616b37f3c4ab29596377dd35657375eda47b399727ea2ef6e8', 'RADI870415KL7', 6, 'WATA GROUP', 'u1', 1, 'DR'),
+  ('u7', 'Carlos Mendoza', 'usuario2@cklass.com', 'scrypt$c528890738e61072ff7c041cb85a4a54$510926174b24a3d4d4db564a35a1536b81a969b36c2d26851f75e07c96ab13cae282a2f0e5ba5e23f445db82a73fe6c506d16439b257029b8ada12defcff1841', 'MECA880215MN8', 1, 'INTERMEDIARIA INTERMEX', 'u2', 1, 'CM'),
+  ('u8', 'Sofía Ramírez', 'usuario3@cklass.com', 'scrypt$824ef86a505ef4207d1c519ab2d9dc28$5a9abca7bbf9a0049db68f1ac0d1c811a998e2d809cea116c10d92103d08f9d3a2073d0d7837707e77b6bf1739a7256f17d9be139bc0d9ac89893dab4031c30f', 'RASO910822PQ4', 1, 'TRANSPORTES DE PERSONAL Y MERCANCIA', 'u2', 1, 'SR');
 
 -- solicitudes
 INSERT INTO solicitudes (id, folio, user_id, fecha, empresa, origen, destino_resumen, tipo_viaje, motivo, personas_count, personas_nombres, monto_total, jefe_status, finanzas_status, estatus, comprobante_viaje, nota_rechazo, created_at) VALUES

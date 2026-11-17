@@ -1,6 +1,11 @@
 import { Router } from "express";
 import { z } from "zod";
 
+import {
+  normalizarListaPalabras,
+  PALABRAS_DEFAULT,
+  type ListasProhibidas,
+} from "../../src/lib/palabras-prohibidas.ts";
 import { hashPassword, me, requireAuth, requirePerm, toAuthUser } from "../auth.ts";
 import { exec, newId, one, rows, tx } from "../db.ts";
 import { bad, forbidden, HttpError, notFound } from "../http.ts";
@@ -43,12 +48,30 @@ adminRouter.get("/config", async (req, res) => {
   res.json(cfg);
 });
 
+// Palabras prohibidas en facturas (alcohol, tabaco, higiene). Si la clave aún no existe en la BD se usan las de código.
+const LISTAS_KEYS = {
+  palabras_prohibidas_alcohol: "alcohol",
+  palabras_prohibidas_tabaco: "tabaco",
+  palabras_prohibidas_higiene: "higiene",
+} as const;
+
+export async function cargarListasProhibidas(): Promise<ListasProhibidas> {
+  const cfg = await loadConfig();
+  const lista = (k: keyof typeof LISTAS_KEYS, def: string[]) =>
+    Array.isArray(cfg[k]) ? normalizarListaPalabras(cfg[k]) : def;
+  return {
+    alcohol: lista("palabras_prohibidas_alcohol", PALABRAS_DEFAULT.alcohol),
+    tabaco: lista("palabras_prohibidas_tabaco", PALABRAS_DEFAULT.tabaco),
+    higiene: lista("palabras_prohibidas_higiene", PALABRAS_DEFAULT.higiene),
+  };
+}
+
 const CONFIG_KEYS = new Set([
   "monto_comida_diario", "umbral_finanzas", "dia_deposito", "email_compras",
   "dias_comprobacion_atrasada", "dias_autorizacion_pendiente", "dias_recordatorio_viaje",
   "notif_email_activo", "notif_email_destinatarios", "smtp_servidor", "smtp_puerto", "smtp_usuario",
   "smtp_password", "smtp_cifrado", "notif_plataforma_activo", "revision_automatica_activo",
-  "bloquear_folio_monto_hotel",
+  "bloquear_folio_monto_hotel", ...Object.keys(LISTAS_KEYS),
 ]);
 
 adminRouter.put("/config", requirePerm("configurar_montos"), async (req, res) => {
@@ -58,9 +81,11 @@ adminRouter.put("/config", requirePerm("configurar_montos"), async (req, res) =>
   await tx(async (c) => {
     for (const [k, v] of Object.entries(body)) {
       if (!CONFIG_KEYS.has(k)) continue;
+      if (k in LISTAS_KEYS && !Array.isArray(v)) throw bad("Las palabras prohibidas deben ser una lista de textos.");
+      const valor = k in LISTAS_KEYS ? normalizarListaPalabras(v) : v;
       await exec(
         "INSERT INTO configuracion (clave, valor) VALUES (?, CAST(? AS JSON)) ON DUPLICATE KEY UPDATE valor = VALUES(valor)",
-        [k, JSON.stringify(v)],
+        [k, JSON.stringify(valor)],
         c,
       );
     }

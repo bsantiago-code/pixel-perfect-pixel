@@ -5,11 +5,13 @@ import multer from "multer";
 import { z } from "zod";
 
 import { conceptoRequierePar } from "../../src/lib/store.ts";
+import { validarContenidoFactura } from "../../src/lib/validar-factura.ts";
 import { me, requireAuth, requirePerm } from "../auth.ts";
 import { exec, newId, one, rows, tx } from "../db.ts";
 import { bad, forbidden, HttpError, notFound } from "../http.ts";
 import { comprobanteOut, facturaOut } from "../mappers.ts";
 import { exigirAlcance } from "../services/solicitudes.ts";
+import { cargarListasProhibidas } from "./admin.ts";
 
 export const comprobacionRouter = Router();
 comprobacionRouter.use(requireAuth);
@@ -97,6 +99,8 @@ comprobacionRouter.post(
       if (rfcMatch && soc && String(rfcMatch[1]).toUpperCase() !== String(soc.rfc).toUpperCase()) {
         throw bad(`El RFC del receptor del XML no coincide con la sociedad (${soc.rfc}). No se guardó el comprobante.`);
       }
+      const v = validarContenidoFactura(text, await cargarListasProhibidas());
+      if (!v.ok) throw bad(v.motivo);
       const t = text.match(/\sTotal=["']([0-9][0-9.,]*)["']/i);
       const leido = t ? parseFloat(t[1].replace(/,/g, "")) : NaN;
       if (leido > 0) total = leido;

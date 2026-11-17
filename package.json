@@ -16,7 +16,7 @@
     "dev:api": "node --watch --env-file=.env.local --import tsx server/index.ts",
     "start:api": "tsx --env-file=.env.local server/index.ts",
     "predev:all": "node scripts/ensure-deps.mjs",
-    "dev:all":"concurrently -k -n api,web -c blue,green \"npm:dev:api\" \"npm:dev\"",
+    "dev:all": "concurrently -k -n api,web -c blue,green \"npm:dev:api\" \"npm:dev\"",
     "lint": "eslint .",
     "format": "prettier --write ."
   },
@@ -61,6 +61,7 @@
     "date-fns": "^4.1.0",
     "embla-carousel-react": "^8.6.0",
     "express": "^5.3.0",
+    "fast-xml-parser": "^5.12.0",
     "input-otp": "^1.4.2",
     "lucide-react": "^0.575.0",
     "multer": "^2.5.0",

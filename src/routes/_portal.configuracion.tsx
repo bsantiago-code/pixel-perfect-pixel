@@ -41,6 +41,67 @@ export const Route = createFileRoute("/_portal/configuracion")({
   component: Configuracion,
 });
 
+// Lista editable de palabras (chips): se agregan con Enter o el botón y se quitan con la X.
+function ListaPalabras({
+  titulo,
+  palabras,
+  onChange,
+}: {
+  titulo: string;
+  palabras: string[];
+  onChange: (v: string[]) => void;
+}) {
+  const [nueva, setNueva] = useState("");
+  const agregar = () => {
+    const t = nueva.trim();
+    if (!t) return;
+    if (palabras.some((p) => p.toLowerCase() === t.toLowerCase())) {
+      setNueva("");
+      return showErrorDialog(`"${t}" ya está en la lista de ${titulo.toLowerCase()}.`);
+    }
+    onChange([...palabras, t]);
+    setNueva("");
+  };
+  return (
+    <div>
+      <label className="ckl-label">{titulo} ({palabras.length})</label>
+      <div className="flex gap-2">
+        <input
+          className="ckl-input"
+          value={nueva}
+          placeholder="Agregar palabra"
+          onChange={(e) => setNueva(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              agregar();
+            }
+          }}
+        />
+        <button type="button" onClick={agregar} className="ckl-btn-outline" aria-label={`Agregar a ${titulo}`}>
+          <Plus size={14} />
+        </button>
+      </div>
+      <div className="mt-2 flex max-h-40 flex-wrap gap-1.5 overflow-y-auto">
+        {palabras.map((p) => (
+          <span key={p} className="inline-flex items-center gap-1 rounded-full border bg-secondary px-2 py-0.5 text-xs">
+            {p}
+            <button
+              type="button"
+              onClick={() => onChange(palabras.filter((x) => x !== p))}
+              aria-label={`Quitar ${p}`}
+              className="text-muted-foreground hover:text-foreground"
+            >
+              <X size={12} />
+            </button>
+          </span>
+        ))}
+        {palabras.length === 0 && <span className="text-xs text-muted-foreground">Sin palabras.</span>}
+      </div>
+    </div>
+  );
+}
+
 // Vista de apoyo (solo lectura): correos informativos "enviados" (simulados, aún sin
 // servidor de correo) y bitácora de eventos. Con la base de datos conectada, los logs
 // se guardan en una tabla `logs`.
@@ -247,6 +308,33 @@ function Configuracion() {
               />
             </button>
           </div>
+        </div>
+        <button onClick={saveCfg} className="ckl-btn-primary mt-4">Guardar</button>
+      </div>
+
+      <div className="ckl-card p-5 lg:col-span-2">
+        <h3 className="text-base font-semibold">Productos no permitidos en facturas</h3>
+        <p className="mt-1 text-xs text-muted-foreground">
+          Al subir un comprobante, el XML se rechaza si algún concepto contiene estas palabras (o si
+          trae IEPS o una clave SAT de alcohol, tabaco o higiene personal). La limpieza institucional
+          sí se permite.
+        </p>
+        <div className="mt-4 grid gap-5 md:grid-cols-3">
+          <ListaPalabras
+            titulo="Alcohol"
+            palabras={draft.palabras_prohibidas_alcohol}
+            onChange={(v) => setDraft({ ...draft, palabras_prohibidas_alcohol: v })}
+          />
+          <ListaPalabras
+            titulo="Tabaco y vapeadores"
+            palabras={draft.palabras_prohibidas_tabaco}
+            onChange={(v) => setDraft({ ...draft, palabras_prohibidas_tabaco: v })}
+          />
+          <ListaPalabras
+            titulo="Higiene personal"
+            palabras={draft.palabras_prohibidas_higiene}
+            onChange={(v) => setDraft({ ...draft, palabras_prohibidas_higiene: v })}
+          />
         </div>
         <button onClick={saveCfg} className="ckl-btn-primary mt-4">Guardar</button>
       </div>

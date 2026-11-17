@@ -517,7 +517,11 @@ INSERT INTO configuracion (clave, valor) VALUES
   ('smtp_cifrado', '"TLS"'),
   ('notif_plataforma_activo', 'true'),
   ('revision_automatica_activo', 'true'),
-  ('bloquear_folio_monto_hotel', 'false');
+  ('bloquear_folio_monto_hotel', 'false'),
+  -- Palabras que rechazan una factura al subirla (Configuración → Productos no permitidos en facturas).
+  ('palabras_prohibidas_alcohol', '["cerveza","vino","tequila","mezcal","whisky","whiskey","ron","vodka","ginebra","brandy","coñac","cognac","licor","sidra","champagne","champaña","aguardiente","bacardi","destilado"]'),
+  ('palabras_prohibidas_tabaco', '["cigarro","cigarrillo","cigarrillos","vape","vapeador","tabaco","puro","nicotina","habano"]'),
+  ('palabras_prohibidas_higiene', '["shampoo","champu","pasta dental","desodorante","maquillaje","cepillo dental","enjuague bucal","rastrillo","crema corporal","toalla sanitaria","tampon","perfume","rimel","labial"]');
 
 -- contador de folios (último folio emitido)
 INSERT INTO folio_contador (id, ultimo) VALUES (1, 70);

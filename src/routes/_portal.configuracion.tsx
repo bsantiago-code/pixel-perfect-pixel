@@ -9,6 +9,7 @@ import {
   lista,
   useApiMutation,
   useCatalogos,
+  useAlmacenamiento,
   useConfig,
   useCorreos,
   useLogs,
@@ -220,6 +221,11 @@ function BitacoraNotificaciones() {
 function Configuracion() {
   const { hasPerm, role } = useAuth();
   const { data: config } = useConfig();
+  const { data: almacenamiento } = useAlmacenamiento();
+  // Escribe, lee y elimina un archivo de prueba en el almacén externo (Google Drive / carpeta).
+  const probarAlmacen = useApiMutation(() => api.post<{ ok: boolean; detalle: string }>("/almacenamiento/probar"), {
+    onSuccess: (r) => toast.success(r.detalle),
+  });
   const sociedades = lista(useCatalogos().data?.sociedades);
   const roles = lista(useRoles().data);
   const users = lista(useUsuarios().data);
@@ -337,6 +343,55 @@ function Configuracion() {
           </div>
         </div>
         <button onClick={saveCfg} className="ckl-btn-primary mt-4">Guardar</button>
+      </div>
+
+      <div className="ckl-card p-5 lg:col-span-2">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h3 className="text-base font-semibold">Almacenamiento de facturas</h3>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Dónde se guardan los archivos XML y PDF de los comprobantes. Se configura con variables de
+              entorno (STORAGE_DRIVER y credenciales en .env.local); ver docs/almacenamiento-google-drive.md.
+            </p>
+          </div>
+          <button
+            onClick={() => probarAlmacen.mutate(undefined)}
+            disabled={probarAlmacen.isPending || almacenamiento?.driver === "db"}
+            className="ckl-btn-outline shrink-0"
+          >
+            {probarAlmacen.isPending ? "Probando…" : "Probar almacenamiento"}
+          </button>
+        </div>
+        {almacenamiento && (
+          <div className="mt-3 grid gap-3 text-sm sm:grid-cols-3">
+            <div>
+              <div className="text-xs text-muted-foreground">Destino actual</div>
+              <div className="font-semibold">
+                {{ db: "Base de datos", local: "Carpeta del servidor", drive: "Google Drive" }[almacenamiento.driver]}
+              </div>
+              <div className="break-all text-xs text-muted-foreground">{almacenamiento.destino}</div>
+            </div>
+            <div>
+              <div className="text-xs text-muted-foreground">Archivos en el almacén externo</div>
+              <div className="font-semibold">{almacenamiento.archivos_en_almacen}</div>
+            </div>
+            <div>
+              <div className="text-xs text-muted-foreground">Archivos aún en la base de datos</div>
+              <div className="font-semibold">{almacenamiento.archivos_en_bd}</div>
+            </div>
+          </div>
+        )}
+        {almacenamiento?.driver === "db" && (
+          <p className="mt-3 rounded-md border bg-secondary p-2 text-xs text-muted-foreground">
+            Los archivos se guardan en la base de datos hasta que se configure Google Drive (o una carpeta).
+          </p>
+        )}
+        {almacenamiento && almacenamiento.driver !== "db" && almacenamiento.archivos_en_bd > 0 && (
+          <p className="mt-3 rounded-md border bg-secondary p-2 text-xs text-muted-foreground">
+            Hay {almacenamiento.archivos_en_bd} archivo(s) anteriores en la base de datos. Para moverlos al almacén
+            externo, un administrador del servidor corre <span className="font-mono">npm run storage:migrar</span>.
+          </p>
+        )}
       </div>
 
       <div className="ckl-card p-5 lg:col-span-2">

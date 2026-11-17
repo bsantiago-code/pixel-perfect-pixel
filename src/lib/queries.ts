@@ -189,6 +189,15 @@ export const useLogs = (params: { entidad?: string; limit?: number } = {}, enabl
   });
 };
 
+export type Almacenamiento = {
+  driver: "db" | "local" | "drive";
+  destino: string;
+  archivos_en_bd: number;
+  archivos_en_almacen: number;
+};
+export const useAlmacenamiento = (enabled = true) =>
+  useQuery({ queryKey: ["almacenamiento"], queryFn: () => api.get<Almacenamiento>("/almacenamiento"), enabled });
+
 export const useCorreos = (enabled = true) =>
   useQuery({ queryKey: ["correos"], queryFn: () => api.get<CorreoSimulado[]>("/correos"), enabled });
 

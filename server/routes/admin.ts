@@ -10,6 +10,7 @@ import { hashPassword, me, requireAuth, requirePerm, toAuthUser } from "../auth.
 import { exec, newId, one, rows, tx } from "../db.ts";
 import { bad, forbidden, HttpError, notFound } from "../http.ts";
 import { cifrarSecreto } from "../secretos.ts";
+import { almacenActivo, almacenDe, AlmacenError, driverConfigurado } from "../storage/index.ts";
 import { correoOut, hotelOut, logOut, sociedadOut } from "../mappers.ts";
 import {
   cargarSmtp,
@@ -172,6 +173,41 @@ adminRouter.post("/config/probar-correo", requirePerm("configurar_montos"), asyn
   } catch (e) {
     if (e instanceof CorreoError) throw new HttpError(e.status, e.message);
     throw e;
+  }
+});
+
+// ───────── almacenamiento de archivos de comprobantes (BD / carpeta local / Google Drive) ─────────
+const aHttp = (e: unknown) => (e instanceof AlmacenError ? new HttpError(e.status, e.message) : e);
+
+adminRouter.get("/almacenamiento", requirePerm("configurar_montos"), async (_req, res) => {
+  try {
+    const driver = driverConfigurado();
+    const almacen = driver === "db" ? null : almacenDe(driver);
+    const [r] = await rows<{ en_bd: number; en_almacen: number }>(
+      "SELECT SUM(ruta IS NULL) AS en_bd, SUM(ruta IS NOT NULL) AS en_almacen FROM facturas",
+    );
+    res.json({
+      driver,
+      destino: almacen?.destino ?? "Base de datos",
+      archivos_en_bd: Number(r?.en_bd ?? 0),
+      archivos_en_almacen: Number(r?.en_almacen ?? 0),
+    });
+  } catch (e) {
+    throw aHttp(e);
+  }
+});
+
+// Escribe, lee y elimina un archivo de prueba en el almacén externo configurado.
+adminRouter.post("/almacenamiento/probar", requirePerm("configurar_montos"), async (_req, res) => {
+  try {
+    const almacen = almacenActivo();
+    if (!almacen) {
+      throw bad("El almacenamiento está en modo base de datos (STORAGE_DRIVER=db): no hay un almacén externo que probar.");
+    }
+    const r = await almacen.probar();
+    res.json({ ok: true, driver: almacen.driver, detalle: r.detalle });
+  } catch (e) {
+    throw aHttp(e);
   }
 });
 

@@ -294,7 +294,7 @@ CREATE TABLE facturas (
   concepto_id     VARCHAR(40)   NULL COMMENT 'Renglón de comprobación al que se aplicó el monto',
   monto_aplicado  DECIMAL(12,2) NOT NULL DEFAULT 0 COMMENT 'Solo el XML aplica monto; permite revertir exacto',
   par_id          VARCHAR(80)   NULL COMMENT 'Comparten par_id el XML y el PDF de un mismo comprobante',
-  ruta            VARCHAR(500)  NULL COMMENT 'Ruta en disco (opcional); el contenido también va en factura_archivos',
+  ruta            VARCHAR(500)  NULL COMMENT 'Archivo en almacenamiento externo: drive:<fileId> o local:<ruta>. NULL = el contenido está en factura_archivos',
   created_at      DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   PRIMARY KEY (id),
   KEY ix_facturas_solicitud (solicitud_id, par_id),
@@ -309,7 +309,7 @@ CREATE TABLE factura_archivos (
   contenido   LONGBLOB     NOT NULL,
   PRIMARY KEY (factura_id),
   CONSTRAINT fk_farch_factura FOREIGN KEY (factura_id) REFERENCES facturas (id) ON DELETE CASCADE
-) ENGINE=InnoDB COMMENT='Archivos aparte para no cargar blobs en los listados';
+) ENGINE=InnoDB COMMENT='Contenido en BD (solo con STORAGE_DRIVER=db o sin migrar); con Drive/carpeta local no hay fila aquí';
 
 -- Compras Corporativas: convenios y revisiones ---------------------------
 CREATE TABLE convenios (

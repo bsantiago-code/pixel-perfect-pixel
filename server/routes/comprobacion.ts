@@ -5,16 +5,38 @@ import multer from "multer";
 import { z } from "zod";
 
 import { conceptoRequierePar } from "../../src/lib/store.ts";
+import { validarContenidoFactura } from "../../src/lib/validar-factura.ts";
 import { me, requireAuth, requirePerm } from "../auth.ts";
 import { exec, newId, one, rows, tx } from "../db.ts";
 import { bad, forbidden, HttpError, notFound } from "../http.ts";
 import { comprobanteOut, facturaOut } from "../mappers.ts";
 import { exigirAlcance } from "../services/solicitudes.ts";
+import { almacenActivo, almacenDeRef, AlmacenError, mimePorNombre, type Almacen } from "../storage/index.ts";
+import { cargarListasProhibidas } from "./admin.ts";
 
 export const comprobacionRouter = Router();
 comprobacionRouter.use(requireAuth);
 
 type R = Record<string, unknown>;
+
+// RFC de TRANSPORTES DE PERSONAL Y MERCANCIA: receptor obligatorio de las facturas de Caseta (cualquier sociedad).
+const RFC_CASETAS = "DCK150601XY1";
+
+// Los errores del almacén (Drive/carpeta) llegan al usuario con su mensaje en español.
+const aHttp = (e: unknown) => (e instanceof AlmacenError ? new HttpError(e.status, e.message) : e);
+
+/** Manda a la papelera los archivos ya guardados (compensación o baja). Nunca lanza. */
+async function quitarArchivos(refs: string[]) {
+  await Promise.allSettled(
+    refs.map(async (ref) => {
+      try {
+        await almacenDeRef(ref).eliminar(ref);
+      } catch (e) {
+        console.error("No se pudo mandar a la papelera el archivo", ref, e instanceof Error ? e.message : e);
+      }
+    }),
+  );
+}
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -33,19 +55,35 @@ comprobacionRouter.get("/facturas", async (req, res) => {
   res.json(list.map(facturaOut));
 });
 
-// Archivo (XML/PDF/foto) guardado en BD, para abrirlo desde el navegador.
+// Archivo (XML/PDF/foto) para abrirlo desde el navegador: del almacén externo (facturas.ruta) o, si no hay
+// ruta, del contenido guardado en la BD. Siempre pasa por la autorización de la solicitud.
 comprobacionRouter.get("/facturas/:id/archivo", async (req, res) => {
   const f = await one<R>(
-    `SELECT f.solicitud_id, f.archivo, a.mime, a.contenido
-       FROM facturas f JOIN factura_archivos a ON a.factura_id = f.id WHERE f.id = ?`,
+    `SELECT f.solicitud_id, f.archivo, f.ruta, a.mime, a.contenido
+       FROM facturas f LEFT JOIN factura_archivos a ON a.factura_id = f.id WHERE f.id = ?`,
     [req.params.id],
   );
   if (!f) throw notFound("El archivo no existe.");
   await exigirAlcance(me(req), String(f.solicitud_id));
-  res.setHeader("Content-Type", String(f.mime));
+  let contenido: Buffer;
+  let mime: string;
+  if (f.ruta) {
+    try {
+      contenido = (await almacenDeRef(String(f.ruta)).leer(String(f.ruta))).buffer;
+    } catch (e) {
+      throw aHttp(e);
+    }
+    mime = mimePorNombre(String(f.archivo));
+  } else if (f.contenido) {
+    contenido = f.contenido as Buffer;
+    mime = String(f.mime);
+  } else {
+    throw notFound("El archivo no existe.");
+  }
+  res.setHeader("Content-Type", mime);
   res.setHeader("Content-Disposition", `inline; filename*=UTF-8''${encodeURIComponent(String(f.archivo))}`);
   res.setHeader("X-Content-Type-Options", "nosniff");
-  res.send(f.contenido as Buffer);
+  res.send(contenido);
 });
 
 // ───────── subir comprobante (par XML + PDF; Vales: un solo archivo) ─────────
@@ -94,14 +132,56 @@ comprobacionRouter.post(
       }
       const soc = await one<R>("SELECT rfc FROM sociedades WHERE nombre = ?", [sol.empresa]);
       const rfcMatch = text.match(/Receptor[^>]*Rfc=["']([^"']+)["']/i);
-      if (rfcMatch && soc && String(rfcMatch[1]).toUpperCase() !== String(soc.rfc).toUpperCase()) {
+      // Las casetas siempre se facturan a TRANSPORTES DE PERSONAL Y MERCANCIA (DCK150601XY1), sea cual sea la
+      // sociedad de la solicitud; el resto de los conceptos van a la sociedad de la solicitud.
+      if (reng.concepto === "Caseta") {
+        if (rfcMatch && String(rfcMatch[1]).toUpperCase() !== RFC_CASETAS) {
+          throw bad(
+            `Las casetas se facturan a TRANSPORTES DE PERSONAL Y MERCANCIA (${RFC_CASETAS}); el RFC del receptor del XML no coincide. No se guardó el comprobante.`,
+          );
+        }
+      } else if (rfcMatch && soc && String(rfcMatch[1]).toUpperCase() !== String(soc.rfc).toUpperCase()) {
         throw bad(`El RFC del receptor del XML no coincide con la sociedad (${soc.rfc}). No se guardó el comprobante.`);
       }
+      const v = validarContenidoFactura(text, await cargarListasProhibidas());
+      if (!v.ok) throw bad(v.motivo);
       const t = text.match(/\sTotal=["']([0-9][0-9.,]*)["']/i);
       const leido = t ? parseFloat(t[1].replace(/,/g, "")) : NaN;
       if (leido > 0) total = leido;
     }
 
+    // Con almacenamiento externo (Drive/carpeta) los archivos se suben antes de la transacción y la BD solo guarda
+    // la referencia. Si la transacción falla, lo subido se manda a la papelera; si el almacén falla, no se guarda nada.
+    let almacen: Almacen | null;
+    try {
+      almacen = almacenActivo();
+    } catch (e) {
+      throw aHttp(e);
+    }
+    const refs = new Map<Express.Multer.File, string>();
+    if (almacen) {
+      try {
+        for (const f of [xml, pdf]) {
+          if (!f) continue;
+          refs.set(
+            f,
+            await almacen.guardar({
+              sociedad: String(sol.empresa),
+              anio: String(sol.fecha).slice(0, 4),
+              folio: String(sol.folio),
+              nombre: f.originalname,
+              mime: f.mimetype || mimePorNombre(f.originalname),
+              buffer: f.buffer,
+            }),
+          );
+        }
+      } catch (e) {
+        await quitarArchivos([...refs.values()]);
+        throw aHttp(e);
+      }
+    }
+
+    try {
     await tx(async (c) => {
       // Se bloquea el renglón para calcular el pendiente sin carreras.
       const r = await one<R>("SELECT monto_solicitado, monto_comprobado FROM comprobantes_gasto WHERE id = ? FOR UPDATE", [req.params.id], c);
@@ -113,12 +193,15 @@ comprobacionRouter.post(
       const insertar = async (f: Express.Multer.File, tipo: string, montoAplicado: number) => {
         const id = newId("f_");
         await exec(
-          `INSERT INTO facturas (id, solicitud_id, tipo, fecha, uuid, archivo, total, status, concepto_id, monto_aplicado, par_id)
-           VALUES (?, ?, ?, CURDATE(), ?, ?, ?, 'Verificado', ?, ?, ?)`,
-          [id, reng.solicitud_id, tipo, uuid, f.originalname, total, reng.id, montoAplicado, parId],
+          `INSERT INTO facturas (id, solicitud_id, tipo, fecha, uuid, archivo, total, status, concepto_id, monto_aplicado, par_id, ruta)
+           VALUES (?, ?, ?, CURDATE(), ?, ?, ?, 'Verificado', ?, ?, ?, ?)`,
+          [id, reng.solicitud_id, tipo, uuid, f.originalname, total, reng.id, montoAplicado, parId, refs.get(f) ?? null],
           c,
         );
-        await exec("INSERT INTO factura_archivos (factura_id, mime, contenido) VALUES (?, ?, ?)", [id, f.mimetype || "application/octet-stream", f.buffer], c);
+        // Solo en modo BD el contenido va en factura_archivos; con almacén externo no se duplica.
+        if (!refs.has(f)) {
+          await exec("INSERT INTO factura_archivos (factura_id, mime, contenido) VALUES (?, ?, ?)", [id, f.mimetype || "application/octet-stream", f.buffer], c);
+        }
       };
       // El trigger trg_facturas_ai suma monto_aplicado al renglón y recalcula su status.
       if (!esVales && xml) await insertar(xml, "XML", aplicado);
@@ -127,6 +210,10 @@ comprobacionRouter.post(
         await insertar(pdf, tipo, esVales ? aplicado : 0);
       }
     }, auth.user.id);
+    } catch (e) {
+      await quitarArchivos([...refs.values()]);
+      throw e;
+    }
 
     const r = await one<R>("SELECT * FROM comprobantes_gasto WHERE id = ?", [req.params.id]);
     res.status(201).json({ renglon: comprobanteOut(r!), uuid, total });
@@ -136,10 +223,12 @@ comprobacionRouter.post(
 // ───────── eliminar comprobante completo (par o archivo suelto); el trigger revierte el monto ─────────
 comprobacionRouter.delete("/comprobacion/facturas/:key", requirePerm("comprobar"), async (req, res) => {
   const auth = me(req);
-  const items = await rows<R>("SELECT id, solicitud_id FROM facturas WHERE par_id = ? OR id = ?", [req.params.key, req.params.key]);
+  const items = await rows<R>("SELECT id, solicitud_id, ruta FROM facturas WHERE par_id = ? OR id = ?", [req.params.key, req.params.key]);
   if (!items.length) throw notFound("El comprobante no existe.");
   await exigirAlcance(auth, String(items[0].solicitud_id));
   await tx((c) => exec("DELETE FROM facturas WHERE par_id = ? OR id = ?", [req.params.key, req.params.key], c), auth.user.id);
+  // Ya sin la fila en BD: los archivos físicos van a la papelera (mejor esfuerzo; un fallo no rompe la baja).
+  await quitarArchivos(items.map((i) => i.ruta).filter((r): r is string => typeof r === "string" && r !== ""));
   res.json({ ok: true, eliminados: items.length });
 });
 

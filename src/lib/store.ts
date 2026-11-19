@@ -248,7 +248,8 @@ export type RevisionMontoManual = {
   comentario?: string;
 };
 
-// Sin servidor de correo todavía: cada correo queda registrado aquí (estado "simulado").
+// Cada correo queda registrado aquí: "simulado" (sin servidor SMTP), "omitido" (correos desactivados),
+// "pendiente" → "enviado" | "error" (envío real por SMTP).
 export type CorreoSimulado = {
   id: string;
   fecha: string; // ISO con hora
@@ -257,7 +258,9 @@ export type CorreoSimulado = {
   asunto: string;
   cuerpo: string;
   referencia: string; // id de la revisión
-  estado: "simulado" | "omitido"; // "omitido": notificaciones por correo desactivadas en Configuración
+  estado: "simulado" | "omitido" | "pendiente" | "enviado" | "error"; // "omitido": correos desactivados en Configuración
+  remitente?: string; // "Nombre" <correo> con el que salió (solo enviados)
+  detalle_error?: string; // motivo cuando estado = "error"
 };
 
 // Bitácora de eventos (tabla `logs`: id, fecha, tipo, entidad, entidad_id, usuario_id, detalle JSON).

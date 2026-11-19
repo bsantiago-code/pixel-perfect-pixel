@@ -3,6 +3,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { api, reportApiError } from "./api";
+import { PALABRAS_DEFAULT } from "./palabras-prohibidas";
 import type {
   Autorizacion,
   ComprobanteGasto,
@@ -45,11 +46,16 @@ export type Config = {
   smtp_servidor: string;
   smtp_puerto: number;
   smtp_usuario: string;
-  smtp_password?: string;
+  smtp_password?: string; // solo se envía al guardar; el servidor nunca la devuelve (va cifrada en BD)
+  smtp_password_configurada?: boolean; // true si ya hay una contraseña SMTP guardada
   smtp_cifrado: string;
+  smtp_remitente: string;
   notif_plataforma_activo: boolean;
   revision_automatica_activo: boolean;
   bloquear_folio_monto_hotel: boolean;
+  palabras_prohibidas_alcohol: string[];
+  palabras_prohibidas_tabaco: string[];
+  palabras_prohibidas_higiene: string[];
 };
 
 export const CONFIG_DEFAULTS: Config = {
@@ -66,9 +72,13 @@ export const CONFIG_DEFAULTS: Config = {
   smtp_puerto: 587,
   smtp_usuario: "",
   smtp_cifrado: "TLS",
+  smtp_remitente: "",
   notif_plataforma_activo: true,
   revision_automatica_activo: true,
   bloquear_folio_monto_hotel: false,
+  palabras_prohibidas_alcohol: PALABRAS_DEFAULT.alcohol,
+  palabras_prohibidas_tabaco: PALABRAS_DEFAULT.tabaco,
+  palabras_prohibidas_higiene: PALABRAS_DEFAULT.higiene,
 };
 
 /** Destino tal como lo guarda/regresa la API (hoteles, transportes, vales y automóvil anidados). */
@@ -178,6 +188,15 @@ export const useLogs = (params: { entidad?: string; limit?: number } = {}, enabl
     enabled,
   });
 };
+
+export type Almacenamiento = {
+  driver: "db" | "local" | "drive";
+  destino: string;
+  archivos_en_bd: number;
+  archivos_en_almacen: number;
+};
+export const useAlmacenamiento = (enabled = true) =>
+  useQuery({ queryKey: ["almacenamiento"], queryFn: () => api.get<Almacenamiento>("/almacenamiento"), enabled });
 
 export const useCorreos = (enabled = true) =>
   useQuery({ queryKey: ["correos"], queryFn: () => api.get<CorreoSimulado[]>("/correos"), enabled });

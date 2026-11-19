@@ -1,4 +1,5 @@
-// Montos manuales de hotel → revisión de Compras (campanita + correo simulado + bitácora).
+// Montos manuales de hotel → revisión de Compras (campanita + correo + bitácora).
+// Devuelve los ids de correo `pendiente`; los envía server/services/correo.ts al terminar la transacción.
 // Port de la lógica de revisiones de monto manual que antes vivía en el front-end.
 import type { PoolConnection } from "mysql2/promise";
 
@@ -141,10 +142,20 @@ export async function crearRevisionesMontoManual(
     c,
   );
 
-  if (!nuevas.length) return [];
+  const correosPendientes: string[] = [];
+  if (!nuevas.length) return correosPendientes;
 
-  const cfg = await rows<R>("SELECT valor FROM configuracion WHERE clave = 'notif_email_activo'", [], c);
-  const correoActivo = !cfg.length || String(cfg[0].valor) !== "false";
+  const cfg = await rows<R>(
+    "SELECT clave, valor FROM configuracion WHERE clave IN ('notif_email_activo', 'smtp_servidor')",
+    [],
+    c,
+  );
+  const valorCfg = (k: string) => cfg.find((r) => r.clave === k)?.valor;
+  const correoActivo = valorCfg("notif_email_activo") === undefined || String(valorCfg("notif_email_activo")) !== "false";
+  const hayServidor = typeof valorCfg("smtp_servidor") === "string" && String(valorCfg("smtp_servidor")).trim() !== "";
+  // omitido: correos desactivados · simulado: sin servidor SMTP · pendiente: se envía al terminar de guardar.
+  const estadoCorreo = !correoActivo ? "omitido" : hayServidor ? "pendiente" : "simulado";
+  const tipoLog = { omitido: "correo_omitido", simulado: "correo_enviado_simulado", pendiente: "correo_en_cola" }[estadoCorreo];
   const destinatarios = await rows<R>(
     `SELECT u.id, u.correo FROM usuarios u JOIN roles r ON r.id = u.rol_id
       WHERE u.activo = 1 AND u.id <> ? AND JSON_UNQUOTE(JSON_EXTRACT(r.permisos, '$.revisar_monto_manual')) = 'true'`,
@@ -170,19 +181,21 @@ export async function crearRevisionesMontoManual(
       }),
     ]);
     for (const u of destinatarios) {
+      const correoId = newId("mail_");
       await exec(
         `INSERT INTO correos (id, fecha, para, usuario_id, asunto, cuerpo, referencia, estado)
          VALUES (?, NOW(3), ?, ?, ?, ?, ?, ?)`,
-        [newId("mail_"), u.correo, u.id, `Monto manual de hotel — ${sol.folio} (${solicitante.nombre})`,
-          cuerpoCorreo({ ...n, folio: sol.folio }, solicitante.nombre), n.id, correoActivo ? "simulado" : "omitido"],
+        [correoId, u.correo, u.id, `Monto manual de hotel — ${sol.folio} (${solicitante.nombre})`,
+          cuerpoCorreo({ ...n, folio: sol.folio }, solicitante.nombre), n.id, estadoCorreo],
         c,
       );
+      if (estadoCorreo === "pendiente") correosPendientes.push(correoId);
       await c.query("CALL sp_registrar_log(?, ?, ?, ?, ?)", [
-        correoActivo ? "correo_enviado_simulado" : "correo_omitido", "revision_monto", n.id, solicitante.id,
+        tipoLog, "revision_monto", n.id, solicitante.id,
         JSON.stringify({ para: u.correo }),
       ]);
     }
   }
-  return nuevas;
+  return correosPendientes;
 }
 

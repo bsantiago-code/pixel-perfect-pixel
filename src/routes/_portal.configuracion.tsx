@@ -9,6 +9,7 @@ import {
   lista,
   useApiMutation,
   useCatalogos,
+  useAlmacenamiento,
   useConfig,
   useCorreos,
   useLogs,
@@ -40,6 +41,75 @@ export const Route = createFileRoute("/_portal/configuracion")({
   head: () => ({ meta: [{ title: "Configuración — CKL" }] }),
   component: Configuracion,
 });
+
+const ESTADO_CORREO: Record<string, string> = {
+  simulado: "Simulado (sin servidor SMTP)",
+  omitido: "Omitido (correos desactivados)",
+  pendiente: "Enviando…",
+  enviado: "Enviado",
+  error: "Error al enviar",
+};
+
+// Lista editable de palabras (chips): se agregan con Enter o el botón y se quitan con la X.
+function ListaPalabras({
+  titulo,
+  palabras,
+  onChange,
+}: {
+  titulo: string;
+  palabras: string[];
+  onChange: (v: string[]) => void;
+}) {
+  const [nueva, setNueva] = useState("");
+  const agregar = () => {
+    const t = nueva.trim();
+    if (!t) return;
+    if (palabras.some((p) => p.toLowerCase() === t.toLowerCase())) {
+      setNueva("");
+      return showErrorDialog(`"${t}" ya está en la lista de ${titulo.toLowerCase()}.`);
+    }
+    onChange([...palabras, t]);
+    setNueva("");
+  };
+  return (
+    <div>
+      <label className="ckl-label">{titulo} ({palabras.length})</label>
+      <div className="flex gap-2">
+        <input
+          className="ckl-input"
+          value={nueva}
+          placeholder="Agregar palabra"
+          onChange={(e) => setNueva(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              agregar();
+            }
+          }}
+        />
+        <button type="button" onClick={agregar} className="ckl-btn-outline" aria-label={`Agregar a ${titulo}`}>
+          <Plus size={14} />
+        </button>
+      </div>
+      <div className="mt-2 flex max-h-40 flex-wrap gap-1.5 overflow-y-auto">
+        {palabras.map((p) => (
+          <span key={p} className="inline-flex items-center gap-1 rounded-full border bg-secondary px-2 py-0.5 text-xs">
+            {p}
+            <button
+              type="button"
+              onClick={() => onChange(palabras.filter((x) => x !== p))}
+              aria-label={`Quitar ${p}`}
+              className="text-muted-foreground hover:text-foreground"
+            >
+              <X size={12} />
+            </button>
+          </span>
+        ))}
+        {palabras.length === 0 && <span className="text-xs text-muted-foreground">Sin palabras.</span>}
+      </div>
+    </div>
+  );
+}
 
 // Vista de apoyo (solo lectura): correos informativos "enviados" (simulados, aún sin
 // servidor de correo) y bitácora de eventos. Con la base de datos conectada, los logs
@@ -82,7 +152,7 @@ function BitacoraNotificaciones() {
                 <td className="whitespace-nowrap p-2">{fh(c.fecha)}</td>
                 <td className="p-2">{c.para}</td>
                 <td className="p-2">{c.asunto}</td>
-                <td className="p-2">{c.estado}</td>
+                <td className="p-2">{ESTADO_CORREO[c.estado] ?? c.estado}</td>
               </tr>
             ))}
             {correos.length === 0 && (
@@ -133,8 +203,14 @@ function BitacoraNotificaciones() {
         <Modal onClose={() => setCorreo(null)}>
           <h3 className="pr-6 text-base font-semibold">{correo.asunto}</h3>
           <div className="mt-1 text-xs text-muted-foreground">
-            Para: {correo.para} · {fh(correo.fecha)} · {correo.estado}
+            {correo.remitente ? `De: ${correo.remitente} · ` : ""}Para: {correo.para} · {fh(correo.fecha)} ·{" "}
+            {ESTADO_CORREO[correo.estado] ?? correo.estado}
           </div>
+          {correo.estado === "error" && correo.detalle_error && (
+            <div className="mt-2 rounded-md border border-red-200 bg-red-50 p-2 text-xs text-red-700">
+              {correo.detalle_error}
+            </div>
+          )}
           <pre className="mt-3 whitespace-pre-wrap rounded-md bg-secondary p-3 text-xs">{correo.cuerpo}</pre>
         </Modal>
       )}
@@ -145,6 +221,11 @@ function BitacoraNotificaciones() {
 function Configuracion() {
   const { hasPerm, role } = useAuth();
   const { data: config } = useConfig();
+  const { data: almacenamiento } = useAlmacenamiento();
+  // Escribe, lee y elimina un archivo de prueba en el almacén externo (Google Drive / carpeta).
+  const probarAlmacen = useApiMutation(() => api.post<{ ok: boolean; detalle: string }>("/almacenamiento/probar"), {
+    onSuccess: (r) => toast.success(r.detalle),
+  });
   const sociedades = lista(useCatalogos().data?.sociedades);
   const roles = lista(useRoles().data);
   const users = lista(useUsuarios().data);
@@ -158,6 +239,19 @@ function Configuracion() {
   const guardarCfg = useApiMutation((c: Config) => api.put("/config", { ...c, smtp_password: c.smtp_password || undefined }), {
     onSuccess: () => toast.success("Configuración guardada."),
   });
+  // Envía un correo real con los valores del formulario (sin necesidad de guardar antes).
+  const probarCorreo = useApiMutation(
+    (c: Config) =>
+      api.post<{ ok: boolean; para: string; remitente: string }>("/config/probar-correo", {
+        smtp_servidor: c.smtp_servidor,
+        smtp_puerto: c.smtp_puerto,
+        smtp_usuario: c.smtp_usuario,
+        smtp_password: c.smtp_password || undefined,
+        smtp_cifrado: c.smtp_cifrado,
+        smtp_remitente: c.smtp_remitente,
+      }),
+    { onSuccess: (r) => toast.success(`Correo de prueba enviado a ${r.para} como "${r.remitente}".`) },
+  );
   const guardarSoc = useApiMutation(
     (s: Sociedad) => (s.id === 0 ? api.post("/sociedades", s) : api.put(`/sociedades/${s.id}`, s)),
     {
@@ -247,6 +341,82 @@ function Configuracion() {
               />
             </button>
           </div>
+        </div>
+        <button onClick={saveCfg} className="ckl-btn-primary mt-4">Guardar</button>
+      </div>
+
+      <div className="ckl-card p-5 lg:col-span-2">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h3 className="text-base font-semibold">Almacenamiento de facturas</h3>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Dónde se guardan los archivos XML y PDF de los comprobantes. Se configura con variables de
+              entorno (STORAGE_DRIVER y credenciales en .env.local); ver docs/almacenamiento-google-drive.md.
+            </p>
+          </div>
+          <button
+            onClick={() => probarAlmacen.mutate(undefined)}
+            disabled={probarAlmacen.isPending || almacenamiento?.driver === "db"}
+            className="ckl-btn-outline shrink-0"
+          >
+            {probarAlmacen.isPending ? "Probando…" : "Probar almacenamiento"}
+          </button>
+        </div>
+        {almacenamiento && (
+          <div className="mt-3 grid gap-3 text-sm sm:grid-cols-3">
+            <div>
+              <div className="text-xs text-muted-foreground">Destino actual</div>
+              <div className="font-semibold">
+                {{ db: "Base de datos", local: "Carpeta del servidor", drive: "Google Drive" }[almacenamiento.driver]}
+              </div>
+              <div className="break-all text-xs text-muted-foreground">{almacenamiento.destino}</div>
+            </div>
+            <div>
+              <div className="text-xs text-muted-foreground">Archivos en el almacén externo</div>
+              <div className="font-semibold">{almacenamiento.archivos_en_almacen}</div>
+            </div>
+            <div>
+              <div className="text-xs text-muted-foreground">Archivos aún en la base de datos</div>
+              <div className="font-semibold">{almacenamiento.archivos_en_bd}</div>
+            </div>
+          </div>
+        )}
+        {almacenamiento?.driver === "db" && (
+          <p className="mt-3 rounded-md border bg-secondary p-2 text-xs text-muted-foreground">
+            Los archivos se guardan en la base de datos hasta que se configure Google Drive (o una carpeta).
+          </p>
+        )}
+        {almacenamiento && almacenamiento.driver !== "db" && almacenamiento.archivos_en_bd > 0 && (
+          <p className="mt-3 rounded-md border bg-secondary p-2 text-xs text-muted-foreground">
+            Hay {almacenamiento.archivos_en_bd} archivo(s) anteriores en la base de datos. Para moverlos al almacén
+            externo, un administrador del servidor corre <span className="font-mono">npm run storage:migrar</span>.
+          </p>
+        )}
+      </div>
+
+      <div className="ckl-card p-5 lg:col-span-2">
+        <h3 className="text-base font-semibold">Productos no permitidos en facturas</h3>
+        <p className="mt-1 text-xs text-muted-foreground">
+          Al subir un comprobante, el XML se rechaza si algún concepto contiene estas palabras (o si
+          trae IEPS o una clave SAT de alcohol, tabaco o higiene personal). La limpieza institucional
+          sí se permite.
+        </p>
+        <div className="mt-4 grid gap-5 md:grid-cols-3">
+          <ListaPalabras
+            titulo="Alcohol"
+            palabras={draft.palabras_prohibidas_alcohol}
+            onChange={(v) => setDraft({ ...draft, palabras_prohibidas_alcohol: v })}
+          />
+          <ListaPalabras
+            titulo="Tabaco y vapeadores"
+            palabras={draft.palabras_prohibidas_tabaco}
+            onChange={(v) => setDraft({ ...draft, palabras_prohibidas_tabaco: v })}
+          />
+          <ListaPalabras
+            titulo="Higiene personal"
+            palabras={draft.palabras_prohibidas_higiene}
+            onChange={(v) => setDraft({ ...draft, palabras_prohibidas_higiene: v })}
+          />
         </div>
         <button onClick={saveCfg} className="ckl-btn-primary mt-4">Guardar</button>
       </div>
@@ -380,10 +550,11 @@ function Configuracion() {
                 </div>
               </div>
               <button
-                onClick={() => toast.success("Correo de prueba enviado.")}
+                onClick={() => probarCorreo.mutate(draft)}
+                disabled={probarCorreo.isPending}
                 className="ckl-btn-outline shrink-0"
               >
-                <Mail size={14} /> Probar correo
+                <Mail size={14} /> {probarCorreo.isPending ? "Enviando…" : "Probar correo"}
               </button>
             </div>
             <div className="mt-3 grid gap-3 sm:grid-cols-2">
@@ -421,7 +592,28 @@ function Configuracion() {
                   className="ckl-input"
                   value={draft.smtp_password ?? ""}
                   onChange={(e) => setDraft({ ...draft, smtp_password: e.target.value })}
+                  autoComplete="new-password"
+                  placeholder={draft.smtp_password_configurada ? "•••••••• (guardada)" : ""}
                 />
+                {draft.smtp_password_configurada && (
+                  <p className="mt-1 text-[11px] text-muted-foreground">
+                    Ya hay una contraseña guardada (cifrada). Déjalo vacío para conservarla o escribe una nueva.
+                  </p>
+                )}
+              </div>
+              <div className="sm:col-span-2">
+                <label className="ckl-label">Remitente (opcional)</label>
+                <input
+                  className="ckl-input"
+                  maxLength={100}
+                  value={draft.smtp_remitente}
+                  onChange={(e) => setDraft({ ...draft, smtp_remitente: e.target.value })}
+                  placeholder="Portal de Viáticos CKL"
+                />
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  Nombre que verá quien reciba el correo. Si lo dejas vacío se muestra solo el correo del
+                  usuario SMTP.
+                </p>
               </div>
               <div className="sm:col-span-2">
                 <label className="ckl-label">Tipo de cifrado</label>

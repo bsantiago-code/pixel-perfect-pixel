@@ -7,6 +7,7 @@ import type { Auth } from "../auth.ts";
 import { exec, getPool, newId, one, rows, tx } from "../db.ts";
 import { scopeSolicitudes } from "../scope.ts";
 import { bad, forbidden, HttpError, notFound } from "../http.ts";
+import { despacharCorreos } from "./correo.ts";
 import { crearRevisionesMontoManual, type DestinoMonto } from "./revisiones.ts";
 
 type R = Record<string, unknown>;
@@ -175,7 +176,7 @@ export async function guardarSolicitud(auth: Auth, editId: string | null, raw: u
   const destinoResumen = `${input.origen} - ${resumen}`;
   const nombres = input.personas_nombres.split(",").map((n) => n.trim()).filter(Boolean).join(", ");
 
-  return tx(async (c) => {
+  const resultado = await tx(async (c) => {
     let solId = editId;
     let folio: string;
     if (editId) {
@@ -285,9 +286,13 @@ export async function guardarSolicitud(auth: Auth, editId: string | null, raw: u
       );
     }
 
-    await crearRevisionesMontoManual(c, { id: solId!, folio }, destinosGuardados, user);
-    return { id: solId!, folio, monto_total: totals.total, editado: !!editId };
+    const correos = await crearRevisionesMontoManual(c, { id: solId!, folio }, destinosGuardados, user);
+    return { id: solId!, folio, monto_total: totals.total, editado: !!editId, correos };
   }, user.id);
+  // Ya con la transacción confirmada: el envío por SMTP va en segundo plano y no afecta la respuesta.
+  despacharCorreos(resultado.correos);
+  const { correos: _correos, ...salida } = resultado;
+  return salida;
 }
 
 /** Verifica que la solicitud exista y que el usuario pueda verla (para acciones sobre un folio). */

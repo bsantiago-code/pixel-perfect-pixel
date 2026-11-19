@@ -18,6 +18,7 @@ import {
 } from "../auth.ts";
 import { exec, newId, one, rows } from "../db.ts";
 import { bad, HttpError } from "../http.ts";
+import { huellaCodigo } from "../secretos.ts";
 
 export const authRouter = Router();
 
@@ -31,10 +32,6 @@ authRouter.post("/auth/login", async (req, res) => {
   const stored = u ? String(u.password) : "";
   if (!u || !u.activo || !(await verifyPassword(stored, password))) {
     throw new HttpError(401, "Usuario o contraseña incorrectos.", "BAD_CREDENTIALS");
-  }
-  // Datos demo con contraseña en claro: se convierten a hash en el primer acceso.
-  if (!stored.startsWith("scrypt$")) {
-    await exec("UPDATE usuarios SET password = ? WHERE id = ?", [await hashPassword(password), u.id]);
   }
   await openSession(res, String(u.id));
   const user = toAuthUser(u);
@@ -73,7 +70,8 @@ authRouter.post("/auth/reset/solicitar", async (req, res) => {
   const u = await findUserByIdentifier(identifier);
   if (!u || !u.activo) throw new HttpError(404, "No encontramos una cuenta activa con ese RFC/usuario.");
   const code = String(randomInt(100000, 1000000));
-  await exec("INSERT INTO reset_codes (id, user_id, code) VALUES (?, ?, ?)", [newId("rc_"), u.id, code]);
+  // Se guarda solo la huella del código; el código en claro únicamente viaja en esta respuesta ("correo simulado").
+  await exec("INSERT INTO reset_codes (id, user_id, code) VALUES (?, ?, ?)", [newId("rc_"), u.id, huellaCodigo(code)]);
   res.json({ code, correo: u.correo });
 });
 
@@ -89,7 +87,7 @@ authRouter.post("/auth/reset/confirmar", async (req, res) => {
           WHERE user_id = ? AND code = ? AND used = 0
             AND created_at >= DATE_SUB(NOW(3), INTERVAL ${RESET_TTL_MIN} MINUTE)
           ORDER BY created_at DESC LIMIT 1`,
-        [u.id, code.trim()],
+        [u.id, huellaCodigo(code)],
       )
     : undefined;
   if (!u || !match) throw bad("Código inválido o expirado.");

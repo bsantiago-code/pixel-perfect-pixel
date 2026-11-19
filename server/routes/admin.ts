@@ -1,10 +1,24 @@
 import { Router } from "express";
 import { z } from "zod";
 
+import {
+  normalizarListaPalabras,
+  PALABRAS_DEFAULT,
+  type ListasProhibidas,
+} from "../../src/lib/palabras-prohibidas.ts";
 import { hashPassword, me, requireAuth, requirePerm, toAuthUser } from "../auth.ts";
 import { exec, newId, one, rows, tx } from "../db.ts";
 import { bad, forbidden, HttpError, notFound } from "../http.ts";
+import { cifrarSecreto } from "../secretos.ts";
+import { almacenActivo, almacenDe, AlmacenError, driverConfigurado } from "../storage/index.ts";
 import { correoOut, hotelOut, logOut, sociedadOut } from "../mappers.ts";
+import {
+  cargarSmtp,
+  CorreoError,
+  enviarCorreo,
+  limpiarNombre,
+  type SmtpCfg,
+} from "../services/correo.ts";
 import { listPrealtas } from "./auth.ts";
 
 export const adminRouter = Router();
@@ -36,19 +50,43 @@ export async function loadConfig(): Promise<Record<string, unknown>> {
   return cfg;
 }
 
-adminRouter.get("/config", async (req, res) => {
+/** Configuración para el navegador: la contraseña SMTP (cifrada en BD) nunca sale; solo si hay una guardada. */
+async function configPublica(): Promise<Record<string, unknown>> {
   const cfg = await loadConfig();
-  // La contraseña SMTP solo la ve quien administra montos/configuración.
-  if (!me(req).role.permisos.configurar_montos) delete cfg.smtp_password;
-  res.json(cfg);
+  const guardada = typeof cfg.smtp_password === "string" && cfg.smtp_password !== "";
+  delete cfg.smtp_password;
+  cfg.smtp_password_configurada = guardada;
+  return cfg;
+}
+
+adminRouter.get("/config", async (_req, res) => {
+  res.json(await configPublica());
 });
+
+// Palabras prohibidas en facturas (alcohol, tabaco, higiene). Si la clave aún no existe en la BD se usan las de código.
+const LISTAS_KEYS = {
+  palabras_prohibidas_alcohol: "alcohol",
+  palabras_prohibidas_tabaco: "tabaco",
+  palabras_prohibidas_higiene: "higiene",
+} as const;
+
+export async function cargarListasProhibidas(): Promise<ListasProhibidas> {
+  const cfg = await loadConfig();
+  const lista = (k: keyof typeof LISTAS_KEYS, def: string[]) =>
+    Array.isArray(cfg[k]) ? normalizarListaPalabras(cfg[k]) : def;
+  return {
+    alcohol: lista("palabras_prohibidas_alcohol", PALABRAS_DEFAULT.alcohol),
+    tabaco: lista("palabras_prohibidas_tabaco", PALABRAS_DEFAULT.tabaco),
+    higiene: lista("palabras_prohibidas_higiene", PALABRAS_DEFAULT.higiene),
+  };
+}
 
 const CONFIG_KEYS = new Set([
   "monto_comida_diario", "umbral_finanzas", "dia_deposito", "email_compras",
   "dias_comprobacion_atrasada", "dias_autorizacion_pendiente", "dias_recordatorio_viaje",
   "notif_email_activo", "notif_email_destinatarios", "smtp_servidor", "smtp_puerto", "smtp_usuario",
-  "smtp_password", "smtp_cifrado", "notif_plataforma_activo", "revision_automatica_activo",
-  "bloquear_folio_monto_hotel",
+  "smtp_password", "smtp_cifrado", "smtp_remitente", "notif_plataforma_activo", "revision_automatica_activo",
+  "bloquear_folio_monto_hotel", ...Object.keys(LISTAS_KEYS),
 ]);
 
 adminRouter.put("/config", requirePerm("configurar_montos"), async (req, res) => {
@@ -58,9 +96,22 @@ adminRouter.put("/config", requirePerm("configurar_montos"), async (req, res) =>
   await tx(async (c) => {
     for (const [k, v] of Object.entries(body)) {
       if (!CONFIG_KEYS.has(k)) continue;
+      if (k in LISTAS_KEYS && !Array.isArray(v)) throw bad("Las palabras prohibidas deben ser una lista de textos.");
+      if (k === "smtp_password") {
+        if (typeof v !== "string") throw bad("La contraseña SMTP debe ser texto.");
+        if (v === "") continue; // vacío = conservar la guardada
+      }
+      const valor =
+        k in LISTAS_KEYS
+          ? normalizarListaPalabras(v)
+          : k === "smtp_remitente"
+            ? limpiarNombre(v)
+            : k === "smtp_password"
+              ? cifrarSecreto(v as string) // AES-256-GCM: nunca se guarda en claro
+              : v;
       await exec(
         "INSERT INTO configuracion (clave, valor) VALUES (?, CAST(? AS JSON)) ON DUPLICATE KEY UPDATE valor = VALUES(valor)",
-        [k, JSON.stringify(v)],
+        [k, JSON.stringify(valor)],
         c,
       );
     }
@@ -74,8 +125,90 @@ adminRouter.put("/config", requirePerm("configurar_montos"), async (req, res) =>
       ]);
     }
   }, auth.user.id);
-  const cfg = await loadConfig();
-  res.json(cfg);
+  res.json(await configPublica());
+});
+
+// Envía un correo de prueba con los valores del formulario (no hace falta guardar antes); si la contraseña
+// viene vacía se usa la guardada. Por omisión va al correo del administrador en sesión.
+adminRouter.post("/config/probar-correo", requirePerm("configurar_montos"), async (req, res) => {
+  const b = z
+    .object({
+      para: z.string().trim().email("El correo de destino no es válido.").optional(),
+      smtp_servidor: z.string().optional(),
+      smtp_puerto: z.coerce.number().int().min(1).max(65535).optional(),
+      smtp_usuario: z.string().optional(),
+      smtp_password: z.string().optional(),
+      smtp_cifrado: z.string().optional(),
+      smtp_remitente: z.string().optional(),
+    })
+    .parse(req.body);
+  let g: SmtpCfg;
+  try {
+    // Si la guardada ya no se puede descifrar pero el formulario trae una nueva, se prueba con la nueva.
+    g = await cargarSmtp({ ignorarPassword: !!b.smtp_password });
+  } catch (e) {
+    if (e instanceof CorreoError) throw new HttpError(e.status, e.message);
+    throw e;
+  }
+  const cfg: SmtpCfg = {
+    servidor: (b.smtp_servidor ?? g.servidor).trim(),
+    puerto: b.smtp_puerto ?? g.puerto,
+    usuario: (b.smtp_usuario ?? g.usuario).trim(),
+    password: b.smtp_password || g.password,
+    cifrado: b.smtp_cifrado || g.cifrado,
+    remitente: limpiarNombre(b.smtp_remitente ?? g.remitente),
+  };
+  const para = b.para ?? me(req).user.correo;
+  try {
+    const r = await enviarCorreo(
+      {
+        para,
+        asunto: "Correo de prueba — Portal de Viáticos CKL",
+        cuerpo:
+          "Este es un correo de prueba del Portal de Viáticos CKL.\n\nSi lo recibes, la configuración SMTP funciona correctamente.",
+      },
+      cfg,
+    );
+    res.json({ ok: true, para, remitente: r.remitente });
+  } catch (e) {
+    if (e instanceof CorreoError) throw new HttpError(e.status, e.message);
+    throw e;
+  }
+});
+
+// ───────── almacenamiento de archivos de comprobantes (BD / carpeta local / Google Drive) ─────────
+const aHttp = (e: unknown) => (e instanceof AlmacenError ? new HttpError(e.status, e.message) : e);
+
+adminRouter.get("/almacenamiento", requirePerm("configurar_montos"), async (_req, res) => {
+  try {
+    const driver = driverConfigurado();
+    const almacen = driver === "db" ? null : almacenDe(driver);
+    const [r] = await rows<{ en_bd: number; en_almacen: number }>(
+      "SELECT SUM(ruta IS NULL) AS en_bd, SUM(ruta IS NOT NULL) AS en_almacen FROM facturas",
+    );
+    res.json({
+      driver,
+      destino: almacen?.destino ?? "Base de datos",
+      archivos_en_bd: Number(r?.en_bd ?? 0),
+      archivos_en_almacen: Number(r?.en_almacen ?? 0),
+    });
+  } catch (e) {
+    throw aHttp(e);
+  }
+});
+
+// Escribe, lee y elimina un archivo de prueba en el almacén externo configurado.
+adminRouter.post("/almacenamiento/probar", requirePerm("configurar_montos"), async (_req, res) => {
+  try {
+    const almacen = almacenActivo();
+    if (!almacen) {
+      throw bad("El almacenamiento está en modo base de datos (STORAGE_DRIVER=db): no hay un almacén externo que probar.");
+    }
+    const r = await almacen.probar();
+    res.json({ ok: true, driver: almacen.driver, detalle: r.detalle });
+  } catch (e) {
+    throw aHttp(e);
+  }
 });
 
 // ───────── sociedades ─────────

@@ -170,7 +170,7 @@ function Solicitar() {
   useEffect(() => {
     if (editId || !user || !bloqueoMsg) return;
     showErrorDialog(bloqueoMsg);
-    nav({ to: "/comprobacion" });
+    nav({ to: bloqueoData?.motivo === "no_autorizado" ? "/dashboard" : "/comprobacion" });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editId, user?.id, bloqueoMsg]);
 

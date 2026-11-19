@@ -114,6 +114,7 @@ CREATE TABLE usuarios (
   empresa   VARCHAR(120) NOT NULL,
   jefe_id   VARCHAR(40)  NULL,
   activo    TINYINT(1)   NOT NULL DEFAULT 1,
+  autorizado_viajar TINYINT(1) NOT NULL DEFAULT 1 COMMENT '0 = "No Autorizado para Viajar" (pre-registro): no puede crear solicitudes hasta que su jefe inmediato lo habilite',
   initials  VARCHAR(4)   NOT NULL DEFAULT '',
   PRIMARY KEY (id),
   UNIQUE KEY uq_usuarios_correo (correo),
@@ -133,7 +134,8 @@ CREATE TABLE prealtas (
   clabe       VARCHAR(18)  NULL,
   sociedad    VARCHAR(120) NULL,
   password    VARCHAR(255) NOT NULL COMMENT 'Hash scrypt (scrypt$salt$hash); nunca en claro',
-  status      VARCHAR(20)  NOT NULL DEFAULT 'pendiente',
+  status      VARCHAR(20)  NOT NULL DEFAULT 'pendiente' COMMENT 'acceso_otorgado: la cuenta se crea al pre-registrarse',
+  usuario_id  VARCHAR(40)  NULL COMMENT 'Cuenta creada con este pre-registro',
   created_at  DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   PRIMARY KEY (id),
   KEY ix_prealtas_status (status)
@@ -405,8 +407,8 @@ INSERT INTO roles (id, nombre, permisos) VALUES
   (1, 'usuario', '{"solicitar":true,"ver_propio":true,"comprobar":true,"ver_equipo":false,"ver_todo":false,"autorizar_lte5000":false,"autorizar_gt5000":false,"rechazar":false,"subir_comprobantes_viaje":false,"ver_reportes":false,"exportar_reportes":false,"gestionar_usuarios":false,"configurar_permisos":false,"configurar_montos":false}'),
   (2, 'jefe_inmediato', '{"solicitar":true,"ver_propio":true,"comprobar":false,"ver_equipo":true,"ver_todo":false,"autorizar_lte5000":true,"autorizar_gt5000":false,"rechazar":true,"subir_comprobantes_viaje":false,"ver_reportes":true,"exportar_reportes":false,"gestionar_usuarios":false,"configurar_permisos":false,"configurar_montos":false}'),
   (3, 'gestor_vuelos', '{"solicitar":false,"ver_propio":false,"comprobar":true,"ver_equipo":false,"ver_todo":true,"autorizar_lte5000":false,"autorizar_gt5000":false,"rechazar":false,"subir_comprobantes_viaje":true,"ver_reportes":false,"exportar_reportes":false,"gestionar_usuarios":false,"configurar_permisos":false,"configurar_montos":false}'),
-  (4, 'finanzas', '{"solicitar":true,"ver_propio":true,"comprobar":false,"ver_equipo":false,"ver_todo":true,"autorizar_lte5000":false,"autorizar_gt5000":true,"rechazar":true,"subir_comprobantes_viaje":false,"ver_reportes":true,"exportar_reportes":true,"gestionar_usuarios":false,"configurar_permisos":false,"configurar_montos":false,"ver_gasto_por_concepto":true}'),
-  (5, 'administrador', '{"solicitar":true,"ver_propio":true,"comprobar":true,"ver_equipo":true,"ver_todo":true,"autorizar_lte5000":true,"autorizar_gt5000":true,"rechazar":true,"subir_comprobantes_viaje":true,"ver_reportes":true,"exportar_reportes":true,"gestionar_usuarios":true,"configurar_permisos":true,"configurar_montos":true,"ver_gasto_por_concepto":true}'),
+  (4, 'finanzas', '{"solicitar":true,"ver_propio":true,"comprobar":false,"ver_equipo":false,"ver_todo":true,"autorizar_lte5000":false,"autorizar_gt5000":true,"rechazar":true,"subir_comprobantes_viaje":false,"ver_reportes":true,"exportar_reportes":true,"gestionar_usuarios":false,"configurar_permisos":false,"configurar_montos":false,"ver_gasto_por_concepto":true,"gestionar_preregistros":true}'),
+  (5, 'administrador', '{"solicitar":true,"ver_propio":true,"comprobar":true,"ver_equipo":true,"ver_todo":true,"autorizar_lte5000":true,"autorizar_gt5000":true,"rechazar":true,"subir_comprobantes_viaje":true,"ver_reportes":true,"exportar_reportes":true,"gestionar_usuarios":true,"configurar_permisos":true,"configurar_montos":true,"ver_gasto_por_concepto":true,"gestionar_preregistros":true}'),
   (6, 'compras_corporativas', '{"validar_comprobacion":true,"revisar_monto_manual":true,"gestionar_convenios":true,"solicitar":true,"ver_propio":true,"comprobar":false,"ver_equipo":false,"ver_todo":true,"autorizar_lte5000":false,"autorizar_gt5000":true,"rechazar":true,"subir_comprobantes_viaje":false,"ver_reportes":true,"exportar_reportes":true,"gestionar_usuarios":false,"configurar_permisos":false,"configurar_montos":false,"ver_gasto_por_concepto":true}');
 
 -- sociedades

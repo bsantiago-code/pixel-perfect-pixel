@@ -112,6 +112,9 @@ function Usuarios() {
                   <div className="mt-0.5 break-all text-xs text-muted-foreground">{u.correo}</div>
                   <div className="mt-0.5 text-xs text-muted-foreground">{u.empresa}</div>
                   <div className="text-xs text-muted-foreground">Jefe: {jefe(u.jefe_id)}</div>
+                  {u.autorizado_viajar === false && (
+                    <div className="mt-1 text-xs font-semibold" style={{ color: "#B45309" }}>No Autorizado para Viajar</div>
+                  )}
                 </div>
                 <div className="flex shrink-0 flex-col items-end gap-2">
                   <button
@@ -139,7 +142,7 @@ function Usuarios() {
         <div className="hidden overflow-x-auto md:block">
           <table className="w-full text-sm">
             <thead className="bg-secondary text-left text-xs text-muted-foreground">
-              <tr><th className="p-3">Nombre</th><th className="p-3">Correo</th><th className="p-3">Rol</th><th className="p-3">Empresa</th><th className="p-3">Jefe</th><th className="p-3">Activo</th><th className="p-3"></th></tr>
+              <tr><th className="p-3">Nombre</th><th className="p-3">Correo</th><th className="p-3">Rol</th><th className="p-3">Empresa</th><th className="p-3">Jefe</th><th className="p-3">Viaje</th><th className="p-3">Activo</th><th className="p-3"></th></tr>
             </thead>
             <tbody>
               {users.map((u) => {
@@ -157,6 +160,13 @@ function Usuarios() {
                     <td className="p-3"><span className="ckl-badge" style={{ background: rc.bg, color: rc.fg }}>{roleName(u.rol_id)}</span></td>
                     <td className="p-3 text-xs">{u.empresa}</td>
                     <td className="p-3 text-xs">{jefe(u.jefe_id)}</td>
+                    <td className="p-3">
+                      {u.autorizado_viajar === false ? (
+                        <span className="ckl-badge" style={{ background: "#FEF3C7", color: "#B45309" }}>No autorizado</span>
+                      ) : (
+                        <span className="ckl-badge" style={{ background: "#D8F3DC", color: "#2D6A4F" }}>Autorizado</span>
+                      )}
+                    </td>
                     <td className="p-3">
                       <button
                         onClick={() => toggleActive(u)}
@@ -219,6 +229,11 @@ function UserModal({ user, roles, users, onClose, onSave }: { user: User; roles:
             {users.filter((x) => x.activo && x.id !== u.id).map((j) => <option key={j.id} value={j.id}>{j.nombre}</option>)}
           </select>
         </div>
+        <label className="col-span-2 flex items-center gap-2 text-sm">
+          <input type="checkbox" checked={u.autorizado_viajar !== false} onChange={(e) => set("autorizado_viajar", e.target.checked)} />
+          Autorizado para viajar
+          <span className="text-xs text-muted-foreground">(desmarcado = “No Autorizado para Viajar”: no puede crear solicitudes)</span>
+        </label>
       </div>
       <div className="mt-5 flex justify-end gap-2">
         <button onClick={onClose} className="ckl-btn-ghost">Cancelar</button>

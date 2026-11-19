@@ -110,7 +110,40 @@ export type SolicitudDetalle = {
   autorizaciones: Autorizacion[];
 };
 
-export type Bloqueo = { mensaje: string | null; folios: string[] };
+export type Bloqueo = { mensaje: string | null; folios: string[]; motivo?: "no_autorizado" | "folios" | null };
+
+/** Cuenta creada desde el Pre-Registro. Los datos bancarios solo llegan a quien tiene gestionar_preregistros. */
+export type Preregistro = {
+  usuario_id: string;
+  nombre: string;
+  correo: string;
+  rfc: string;
+  sociedad: string;
+  jefe_id: string | null;
+  jefe_nombre: string | null;
+  autorizado_viajar: boolean;
+  fecha: string;
+  puede_habilitar: boolean;
+  banco?: string;
+  cuenta?: string;
+  clabe?: string;
+};
+/** Sociedades del formulario de Pre-Registro (endpoint público: aún no hay sesión). */
+export const useSociedadesPublicas = () =>
+  useQuery({ queryKey: ["sociedades-publicas"], queryFn: () => api.get<{ nombre: string }[]>("/prealtas/sociedades") });
+export const usePreregistros = (enabled = true) =>
+  useQuery({
+    queryKey: ["preregistros"],
+    queryFn: () => api.get<Preregistro[]>("/preregistros"),
+    enabled,
+    refetchInterval: POLL_MS,
+  });
+export const useJefesPosibles = (enabled = true) =>
+  useQuery({
+    queryKey: ["preregistros", "jefes"],
+    queryFn: () => api.get<{ id: string; nombre: string }[]>("/preregistros/jefes"),
+    enabled,
+  });
 
 /** `ventana=false` quita el límite de 2/4 meses (p. ej. Comprobación). */
 const q = (ventana: boolean) => (ventana ? "" : "?ventana=0");

@@ -5,7 +5,8 @@ import { Eye, EyeOff, ArrowLeft } from "lucide-react";
 import { useAuth } from "@/lib/auth";
 import { showErrorDialog } from "@/components/ErrorDialog";
 import { api, ApiError, reportApiError } from "@/lib/api";
-import { lista, useApiMutation, useCatalogos } from "@/lib/queries";
+import { lista, useApiMutation, useSociedadesPublicas } from "@/lib/queries";
+import { evaluarContrasena, PASSWORD_MIN_LENGTH } from "@/lib/store";
 import cklassLogo from "@/cklass-logo.png";
 import imagenInicio from "@/imagen-inicio.png";
 
@@ -152,8 +153,8 @@ function LoginPage() {
 }
 
 function PreAltaForm({ onBack }: { onBack: () => void }) {
-  const { data: cat } = useCatalogos();
-  const sociedades = lista(cat?.sociedades);
+  const { data: socData } = useSociedadesPublicas();
+  const sociedades = lista(socData);
   const [f, setF] = useState({
     nombre: "", correo: "", rfc: "", banco: "", cuenta: "", clabe: "",
     sociedad: "", password: "", confirm: "",
@@ -167,7 +168,7 @@ function PreAltaForm({ onBack }: { onBack: () => void }) {
     },
     {
       onSuccess: () => {
-        toast.success("Pre-Registro enviado.");
+        toast.success("Tu cuenta fue creada. Ya puedes iniciar sesión; no podrás crear solicitudes hasta que tu jefe inmediato te habilite.");
         onBack();
       },
     },
@@ -175,8 +176,17 @@ function PreAltaForm({ onBack }: { onBack: () => void }) {
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!f.nombre || !f.correo || !f.password) {
-      showErrorDialog("Completa los campos obligatorios.");
+    if (!f.nombre || !f.correo || !f.rfc || !f.password) {
+      showErrorDialog("Completa los campos obligatorios (nombre, correo, RFC y contraseña).");
+      return;
+    }
+    const reglas = evaluarContrasena(f.password, { correo: f.correo, nombre: f.nombre });
+    if (!reglas.longitud) {
+      showErrorDialog(`La contraseña debe tener al menos ${PASSWORD_MIN_LENGTH} caracteres.`);
+      return;
+    }
+    if (!reglas.noComun) {
+      showErrorDialog("La contraseña es demasiado común o fácil de adivinar.");
       return;
     }
     if (f.password !== f.confirm) {
@@ -192,10 +202,10 @@ function PreAltaForm({ onBack }: { onBack: () => void }) {
         <ArrowLeft size={14} /> Regresar
       </button>
       <h2 className="text-lg font-semibold">Pre-Registro de cuenta</h2>
-      <p className="mt-1 text-xs text-muted-foreground">Tu solicitud quedará pendiente de aprobación por el administrador.</p>
+      <p className="mt-1 text-xs text-muted-foreground">Tu cuenta se crea de inmediato y podrás entrar al portal, pero quedará como “No Autorizado para Viajar”: no podrás crear solicitudes hasta que tu jefe inmediato te habilite. Finanzas recibirá un aviso y le asignará tu jefe.</p>
       <div className="mt-4 grid grid-cols-2 gap-3">
         {([
-          ["nombre", "Nombre *"], ["correo", "Correo *"], ["rfc", "RFC"],
+          ["nombre", "Nombre *"], ["correo", "Correo *"], ["rfc", "RFC *"],
           ["banco", "Banco"], ["cuenta", "No. Cuenta"], ["clabe", "CLABE"],
         ] as const).map(([k, l]) => (
           <div key={k}>
@@ -206,7 +216,7 @@ function PreAltaForm({ onBack }: { onBack: () => void }) {
         <div className="col-span-2">
           <label className="ckl-label">Sociedad</label>
           <select className="ckl-input" value={sociedadSel} onChange={(e) => set("sociedad", e.target.value)}>
-            {sociedades.map((s) => <option key={s.id} value={s.nombre}>{s.nombre}</option>)}
+            {sociedades.map((s) => <option key={s.nombre} value={s.nombre}>{s.nombre}</option>)}
           </select>
         </div>
         <div>
@@ -218,7 +228,7 @@ function PreAltaForm({ onBack }: { onBack: () => void }) {
           <input type="password" className="ckl-input" value={f.confirm} onChange={(e) => set("confirm", e.target.value)} />
         </div>
       </div>
-      <button type="submit" className="ckl-btn-primary mt-5 w-full justify-center">Enviar Pre-Registro</button>
+      <button type="submit" className="ckl-btn-primary mt-5 w-full justify-center" disabled={enviar.isPending}>Crear mi cuenta</button>
     </form>
   );
 }

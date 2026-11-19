@@ -21,6 +21,8 @@ export type User = {
   jefe_id: string | null;
   activo: boolean;
   initials: string;
+  // false = "No Autorizado para Viajar": puede entrar al portal pero no crear solicitudes (lo habilita su jefe inmediato).
+  autorizado_viajar?: boolean;
 };
 
 export type Sociedad = {

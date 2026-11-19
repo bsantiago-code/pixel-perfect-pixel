@@ -284,7 +284,7 @@ adminRouter.put("/roles/permisos", requirePerm("configurar_permisos"), async (re
 });
 
 // ───────── usuarios ─────────
-const COLS = "id, nombre, correo, rfc, rol_id, empresa, jefe_id, activo, initials";
+const COLS = "id, nombre, correo, rfc, rol_id, empresa, jefe_id, activo, initials, autorizado_viajar";
 
 adminRouter.get("/usuarios", async (_req, res) => {
   const list = await rows<R>(`SELECT ${COLS} FROM usuarios ORDER BY nombre`);
@@ -299,6 +299,8 @@ const userSchema = z.object({
   empresa: z.string().min(1),
   jefe_id: z.string().nullable().optional(),
   activo: z.boolean().default(true),
+  // false = "No Autorizado para Viajar" (no puede crear solicitudes). Sin enviarlo, no cambia.
+  autorizado_viajar: z.boolean().optional(),
   initials: z.string().default(""),
   password: z.string().optional(),
 });
@@ -316,9 +318,9 @@ adminRouter.post("/usuarios", requirePerm("gestionar_usuarios"), async (req, res
   }
   const id = newId("u_");
   await exec(
-    `INSERT INTO usuarios (id, nombre, correo, password, rfc, rol_id, empresa, jefe_id, activo, initials)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [id, u.nombre, u.correo, await hashPassword(u.password), u.rfc, u.rol_id, u.empresa, u.jefe_id ?? null, u.activo, u.initials],
+    `INSERT INTO usuarios (id, nombre, correo, password, rfc, rol_id, empresa, jefe_id, activo, autorizado_viajar, initials)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [id, u.nombre, u.correo, await hashPassword(u.password), u.rfc, u.rol_id, u.empresa, u.jefe_id ?? null, u.activo, u.autorizado_viajar ?? true, u.initials],
   );
   res.status(201).json(toAuthUser((await one<R>(`SELECT ${COLS} FROM usuarios WHERE id = ?`, [id]))!));
 });
@@ -333,6 +335,10 @@ adminRouter.put("/usuarios/:id", requirePerm("gestionar_usuarios"), async (req, 
   }
   const sets = ["nombre = ?", "correo = ?", "rfc = ?", "rol_id = ?", "empresa = ?", "jefe_id = ?", "activo = ?", "initials = ?"];
   const params: unknown[] = [u.nombre, u.correo, u.rfc, u.rol_id, u.empresa, u.jefe_id ?? null, u.activo, u.initials];
+  if (u.autorizado_viajar !== undefined) {
+    sets.push("autorizado_viajar = ?");
+    params.push(u.autorizado_viajar);
+  }
   if (u.password) {
     sets.push("password = ?");
     params.push(await hashPassword(u.password));

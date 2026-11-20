@@ -8,6 +8,7 @@ import { lista, useCatalogos, useComprobantes, useSolicitudes, useUsuarios } fro
 import { fmtMoney, avanceComprobacion, estatusVisible, type Solicitud } from "@/lib/store";
 import { StatusBadge } from "./_portal.dashboard";
 import { ReporteGasto } from "@/components/portal/GastoPorConcepto";
+import { Paginacion, usePaginacion } from "@/components/portal/Paginacion";
 
 export const Route = createFileRoute("/_portal/reportes")({
   // vista=gasto abre directamente el reporte de gasto por concepto
@@ -77,6 +78,8 @@ function Reportes() {
     const days = (Date.now() - new Date(s.created_at).getTime()) / 86400000;
     return { ...s, vencimiento: days > 7 && s.estatus === "Cerrado" && !s.comprobante_viaje ? "Vencido" : "A tiempo" };
   }), [results]);
+  // La tabla se pagina; la exportación a Excel sigue usando todos los resultados.
+  const { visibles: paginaReporte, paginacion } = usePaginacion(enriched);
 
   if (!hasPerm("ver_reportes")) {
     return <div className="ckl-card p-8 text-center text-sm">Sin permiso para acceder.</div>;
@@ -141,7 +144,7 @@ function Reportes() {
       <div className="ckl-card overflow-hidden">
         {/* Móvil (< 768 px): tarjetas apiladas en lugar de tabla de 8 columnas. */}
         <ul className="divide-y md:hidden">
-          {enriched.map((s) => (
+          {paginaReporte.map((s) => (
             <li key={s.id} className="p-3">
               <div className="flex items-center justify-between gap-2">
                 <span className="font-mono text-xs font-semibold">{s.folio}</span>
@@ -166,7 +169,7 @@ function Reportes() {
               <tr><th className="p-3">Folio</th><th className="p-3">Fecha</th><th className="p-3">Usuario</th><th className="p-3">Sociedad</th><th className="p-3">Destino</th><th className="p-3 text-right">Monto</th><th className="p-3">Vencimiento</th><th className="p-3">Estatus</th></tr>
             </thead>
             <tbody>
-              {enriched.map((s) => (
+              {paginaReporte.map((s) => (
                 <tr key={s.id} className="border-t">
                   <td className="p-3 font-mono text-xs">{s.folio}</td>
                   <td className="p-3 text-xs">{s.fecha}</td>
@@ -182,6 +185,7 @@ function Reportes() {
             </tbody>
           </table>
         </div>
+        <Paginacion {...paginacion} className="border-t px-3" />
       </div>
         </>
       )}

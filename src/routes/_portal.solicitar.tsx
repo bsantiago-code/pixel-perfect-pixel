@@ -1,6 +1,15 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
-import { Plus, X, CheckCircle2, AlertTriangle, Calendar as CalendarIcon } from "lucide-react";
+import {
+  Plus,
+  X,
+  CheckCircle2,
+  AlertTriangle,
+  Calendar as CalendarIcon,
+  Phone,
+  Mail,
+  MapPin,
+} from "lucide-react";
 import { format, parseISO, isValid } from "date-fns";
 import { es } from "date-fns/locale";
 import { toast } from "sonner";
@@ -8,7 +17,14 @@ import { useAuth } from "@/lib/auth";
 import { showErrorDialog } from "@/components/ErrorDialog";
 import { Calendar } from "@/components/ui/calendar";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { fmtMoney, tarifaHotel, fmtTarifa, type TipoHabitacion, type Hotel } from "@/lib/store";
+import {
+  ESTADOS_MX,
+  fmtMoney,
+  tarifaHotel,
+  fmtTarifa,
+  type TipoHabitacion,
+  type Hotel,
+} from "@/lib/store";
 import { api } from "@/lib/api";
 import {
   useCatalogos, useConfig, useSolicitudDetalle, useBloqueoNuevaSolicitud, useApiMutation,
@@ -27,7 +43,6 @@ export const Route = createFileRoute("/_portal/solicitar")({
   component: Solicitar,
 });
 
-const ESTADOS = ["Jalisco", "CDMX", "Guanajuato", "Nuevo León", "Querétaro", "Colima", "Zacatecas"];
 const TIPOS = ["Comercial", "Auditoría", "Visita a tiendas", "Capacitación", "Expos", "Visita a proveedores", "Otros"];
 const MEDIOS_FORANEO = ["Avión", "Autobús", "Tren", "Otro"];
 const MEDIOS_LOCAL = ["Uber", "Taxi", "Metro", "Combi", "Otro"];
@@ -131,7 +146,6 @@ function Solicitar() {
   const nav = useNavigate();
   const { editId } = Route.useSearch();
   const { data: catalogos } = useCatalogos();
-  const origenes = lista(catalogos?.origenes);
   const hoteles = lista(catalogos?.hoteles);
   const { data: configData } = useConfig();
   const config = configData ?? CONFIG_DEFAULTS;
@@ -177,8 +191,12 @@ function Solicitar() {
   const [folio, setFolio] = useState<string | null>(null);
   const today = new Date().toLocaleDateString("es-MX");
   const todayIso = new Date().toISOString().slice(0, 10);
+  // Origen = estado (los 32 de ESTADOS_MX), igual que los destinos. Sin valor por omisión: el usuario lo elige.
   const [origenSel, setOrigen] = useState<string | null>(null);
-  const origen = origenSel ?? origenes[0] ?? "";
+  const origen = origenSel ?? "";
+  // Al editar una solicitud antigua cuyo origen es una ciudad del catálogo anterior, se conserva como opción.
+  const origenesDisponibles =
+    origen && !ESTADOS_MX.includes(origen) ? [origen, ...ESTADOS_MX] : ESTADOS_MX;
   const [tipo, setTipo] = useState(TIPOS[0]);
   const [personas, setPersonasCount] = useState(1);
   // Un input por viajero (en vez de un solo texto libre) para que capturar
@@ -283,6 +301,7 @@ function Solicitar() {
   const guardar = () => {
     if (guardarMut.isPending) return;
     if (!editing && bloqueoMsg) return showErrorDialog(bloqueoMsg);
+    if (!origen) return showErrorDialog("Selecciona el estado de origen del viaje.");
     if (!motivo.trim()) return showErrorDialog("Captura el motivo del viaje.");
     for (let i = 0; i < destinos.length; i++) {
       const d = destinos[i];
@@ -416,7 +435,8 @@ function Solicitar() {
           <Field label="Empresa"><input className="ckl-input" value={user?.empresa ?? ""} readOnly /></Field>
           <Field label="Origen">
             <select className="ckl-input" value={origen} onChange={(e) => setOrigen(e.target.value)}>
-              {origenes.map((o) => <option key={o}>{o}</option>)}
+              <option value="">— Selecciona —</option>
+              {origenesDisponibles.map((o) => <option key={o}>{o}</option>)}
             </select>
           </Field>
           <Field label="Tipo de viaje">
@@ -625,10 +645,11 @@ function DestinoBlock({
   onRemove?: () => void;
 }) {
   const filteredHotels = hoteles.filter((h) => h.estado === d.estado && h.activo);
-  // Destinos disponibles: los de siempre + los estados de hoteles activos del catálogo
-  // (los convenios nuevos abren destinos nuevos).
+  // Destinos disponibles: los 32 estados de México (ESTADOS_MX) + cualquier estado de un hotel activo
+  // del catálogo que no venga escrito igual (para no perder ninguno). En los estados sin hoteles con
+  // convenio, el hospedaje se captura con "Monto manual por noche" (y pasa a revisión de Compras).
   const estadosDisponibles = [
-    ...new Set([...ESTADOS, ...hoteles.filter((h) => h.activo).map((h) => h.estado)]),
+    ...new Set([...ESTADOS_MX, ...hoteles.filter((h) => h.activo && h.estado).map((h) => h.estado)]),
   ];
   const days = daysBetween(d.fecha_inicio, d.fecha_fin);
 
@@ -748,6 +769,13 @@ function DestinoBlock({
                             ],
                       )}
                     </select>
+                    {filteredHotels.length === 0 && (
+                      <p className="mt-1 text-[11px] text-muted-foreground">
+                        No hay hoteles con convenio en {d.estado}. Activa “Monto manual por noche” y
+                        captura la tarifa y el motivo; Compras revisará el monto.
+                      </p>
+                    )}
+                    <FichaHotel hotel={filteredHotels.find((ho) => ho.id === h.hotel_id)} />
                   </div>
                   <DateField
                     className="max-w-[150px]"
@@ -957,6 +985,52 @@ function OtrosSection({ rows, onChange }: { rows: OtroRow[]; onChange: (r: OtroR
           </div>
         ))}
       </div>
+    </div>
+  );
+}
+
+// Ficha compacta del hotel elegido: datos de contacto de su convenio vigente para hacer la reservación
+// (teléfono, correo y dirección). Solo aparece con un hotel seleccionado; sin datos lo indica en una línea.
+function FichaHotel({ hotel }: { hotel?: Hotel }) {
+  if (!hotel) return null;
+  const { telefono, correo, direccion } = hotel;
+  if (!telefono && !correo && !direccion) {
+    return (
+      <p className="mt-1 text-[11px] text-muted-foreground">
+        Este hotel no tiene datos de contacto registrados en su convenio.
+      </p>
+    );
+  }
+  const mapa = direccion
+    ? `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${hotel.nombre}, ${direccion}`)}`
+    : null;
+  return (
+    <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 rounded-md bg-secondary/60 px-2.5 py-1.5 text-[11px] text-muted-foreground">
+      {telefono && (
+        // El enlace marca el primer número ("962 62 66060 al 64" → 9626266060); el texto se muestra completo.
+        <a
+          href={`tel:${telefono.split(/\s+al\s+|\/|,|;|\s+y\s+/i)[0].replace(/[^\d+]/g, "")}`}
+          className="inline-flex items-center gap-1 hover:text-foreground"
+        >
+          <Phone size={12} /> {telefono}
+        </a>
+      )}
+      {correo && (
+        <a href={`mailto:${correo}`} className="inline-flex items-center gap-1 break-all hover:text-foreground">
+          <Mail size={12} /> {correo}
+        </a>
+      )}
+      {direccion && mapa && (
+        <a
+          href={mapa}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="inline-flex items-center gap-1 hover:text-foreground"
+          title="Ver en el mapa"
+        >
+          <MapPin size={12} /> {direccion}
+        </a>
+      )}
     </div>
   );
 }

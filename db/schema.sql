@@ -37,7 +37,7 @@ DROP PROCEDURE IF EXISTS sp_dar_baja_convenio;
 DROP PROCEDURE IF EXISTS sp_reactivar_convenio;
 DROP PROCEDURE IF EXISTS sp_gasto_por_concepto;
 
-DROP TABLE IF EXISTS logs, correos, revisiones_monto, convenios, factura_archivos, facturas,
+DROP TABLE IF EXISTS compensaciones, logs, correos, revisiones_monto, convenios, factura_archivos, facturas,
   comprobantes_gasto, notas, autorizaciones, destino_vales, destino_transportes, destino_hoteles,
   solicitud_destinos, solicitudes, sesiones, reset_codes, prealtas, usuarios, folio_contador,
   configuracion, estados_mx, origenes, hoteles, sociedades, roles;
@@ -296,7 +296,10 @@ CREATE TABLE facturas (
   par_id          VARCHAR(80)   NULL COMMENT 'Comparten par_id el XML y el PDF de un mismo comprobante',
   ruta            VARCHAR(500)  NULL COMMENT 'Archivo en almacenamiento externo: drive:<fileId> o local:<ruta>. NULL = el contenido está en factura_archivos',
   created_at      DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  uuid_xml        VARCHAR(60)   GENERATED ALWAYS AS (IF(tipo = 'XML' AND uuid <> '', uuid, NULL)) VIRTUAL
+                  COMMENT 'UUID fiscal solo en los XML: el índice único impide comprobar dos veces la misma factura',
   PRIMARY KEY (id),
+  UNIQUE KEY uq_facturas_uuid_xml (uuid_xml),
   KEY ix_facturas_solicitud (solicitud_id, par_id),
   KEY ix_facturas_concepto (concepto_id),
   CONSTRAINT fk_facturas_solicitud FOREIGN KEY (solicitud_id) REFERENCES solicitudes (id)        ON DELETE CASCADE,
@@ -328,6 +331,7 @@ CREATE TABLE convenios (
   contacto         VARCHAR(150)  NOT NULL DEFAULT '',
   banco            VARCHAR(80)   NOT NULL DEFAULT '',
   correo           VARCHAR(150)  NOT NULL DEFAULT '',
+  direccion        VARCHAR(300)  NOT NULL DEFAULT '' COMMENT 'Dirección del hotel (se muestra al reservar en Solicitar)',
   notas            TEXT          NULL,
   activo           TINYINT(1)    NOT NULL DEFAULT 1 COMMENT 'Baja lógica',
   baja_motivo      VARCHAR(500)  NULL,
@@ -368,6 +372,25 @@ CREATE TABLE revisiones_monto (
   CONSTRAINT fk_rev_hotel     FOREIGN KEY (hotel_id)     REFERENCES hoteles (id)     ON DELETE SET NULL
 ) ENGINE=InnoDB;
 
+-- Cierre de un viaje por Finanzas/Compras (permiso compensar_viaje) cuando ya está comprobado al 100 % y
+-- validado por Compras: se decide si se le reembolsa al viajero lo que gastó de más (facturas por encima de lo
+-- solicitado). Un folio compensado ya no admite cambios en sus facturas y sale de las vistas por omisión.
+CREATE TABLE compensaciones (
+  id               VARCHAR(40)   NOT NULL,
+  solicitud_id     VARCHAR(40)   NOT NULL,
+  decision         ENUM('reembolsar','no_reembolsar','sin_excedente') NOT NULL,
+  monto_solicitado DECIMAL(12,2) NOT NULL COMMENT 'Fotografía al compensar',
+  monto_comprobado DECIMAL(12,2) NOT NULL COMMENT 'Lo aplicado a los renglones (tope = solicitado)',
+  monto_excedente  DECIMAL(12,2) NOT NULL DEFAULT 0 COMMENT 'Facturado por encima de lo solicitado',
+  monto_reembolso  DECIMAL(12,2) NOT NULL DEFAULT 0 COMMENT 'Lo que se le reembolsa al viajero (≤ excedente)',
+  comentario       TEXT          NULL,
+  compensado_por   VARCHAR(40)   NOT NULL,
+  compensado_at    DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_compensacion_solicitud (solicitud_id),
+  CONSTRAINT fk_comp_solicitud FOREIGN KEY (solicitud_id) REFERENCES solicitudes (id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
 CREATE TABLE correos (
   id          VARCHAR(40)  NOT NULL,
   fecha       DATETIME(3)  NOT NULL,
@@ -405,9 +428,9 @@ INSERT INTO roles (id, nombre, permisos) VALUES
   (1, 'usuario', '{"solicitar":true,"ver_propio":true,"comprobar":true,"ver_equipo":false,"ver_todo":false,"autorizar_lte5000":false,"autorizar_gt5000":false,"rechazar":false,"subir_comprobantes_viaje":false,"ver_reportes":false,"exportar_reportes":false,"gestionar_usuarios":false,"configurar_permisos":false,"configurar_montos":false}'),
   (2, 'jefe_inmediato', '{"solicitar":true,"ver_propio":true,"comprobar":false,"ver_equipo":true,"ver_todo":false,"autorizar_lte5000":true,"autorizar_gt5000":false,"rechazar":true,"subir_comprobantes_viaje":false,"ver_reportes":true,"exportar_reportes":false,"gestionar_usuarios":false,"configurar_permisos":false,"configurar_montos":false}'),
   (3, 'gestor_vuelos', '{"solicitar":false,"ver_propio":false,"comprobar":true,"ver_equipo":false,"ver_todo":true,"autorizar_lte5000":false,"autorizar_gt5000":false,"rechazar":false,"subir_comprobantes_viaje":true,"ver_reportes":false,"exportar_reportes":false,"gestionar_usuarios":false,"configurar_permisos":false,"configurar_montos":false}'),
-  (4, 'finanzas', '{"solicitar":true,"ver_propio":true,"comprobar":false,"ver_equipo":false,"ver_todo":true,"autorizar_lte5000":false,"autorizar_gt5000":true,"rechazar":true,"subir_comprobantes_viaje":false,"ver_reportes":true,"exportar_reportes":true,"gestionar_usuarios":false,"configurar_permisos":false,"configurar_montos":false,"ver_gasto_por_concepto":true}'),
+  (4, 'finanzas', '{"compensar_viaje":true,"solicitar":true,"ver_propio":true,"comprobar":false,"ver_equipo":false,"ver_todo":true,"autorizar_lte5000":false,"autorizar_gt5000":true,"rechazar":true,"subir_comprobantes_viaje":false,"ver_reportes":true,"exportar_reportes":true,"gestionar_usuarios":false,"configurar_permisos":false,"configurar_montos":false,"ver_gasto_por_concepto":true}'),
   (5, 'administrador', '{"solicitar":true,"ver_propio":true,"comprobar":true,"ver_equipo":true,"ver_todo":true,"autorizar_lte5000":true,"autorizar_gt5000":true,"rechazar":true,"subir_comprobantes_viaje":true,"ver_reportes":true,"exportar_reportes":true,"gestionar_usuarios":true,"configurar_permisos":true,"configurar_montos":true,"ver_gasto_por_concepto":true}'),
-  (6, 'compras_corporativas', '{"validar_comprobacion":true,"revisar_monto_manual":true,"gestionar_convenios":true,"solicitar":true,"ver_propio":true,"comprobar":false,"ver_equipo":false,"ver_todo":true,"autorizar_lte5000":false,"autorizar_gt5000":true,"rechazar":true,"subir_comprobantes_viaje":false,"ver_reportes":true,"exportar_reportes":true,"gestionar_usuarios":false,"configurar_permisos":false,"configurar_montos":false,"ver_gasto_por_concepto":true}');
+  (6, 'compras_corporativas', '{"compensar_viaje":true,"validar_comprobacion":true,"revisar_monto_manual":true,"gestionar_convenios":true,"solicitar":true,"ver_propio":true,"comprobar":false,"ver_equipo":false,"ver_todo":true,"autorizar_lte5000":false,"autorizar_gt5000":true,"rechazar":true,"subir_comprobantes_viaje":false,"ver_reportes":true,"exportar_reportes":true,"gestionar_usuarios":false,"configurar_permisos":false,"configurar_montos":false,"ver_gasto_por_concepto":true}');
 
 -- sociedades
 INSERT INTO sociedades (id, nombre, rfc, regimen, cp, uso_cfdi, sociedad_sap) VALUES
@@ -1557,6 +1580,9 @@ BEGIN
     END IF;
     IF NOT (OLD.correo <=> NEW.correo) THEN
       SET v_cambios = JSON_MERGE_PATCH(v_cambios, JSON_OBJECT('correo', JSON_OBJECT('antes', OLD.correo, 'despues', NEW.correo)));
+    END IF;
+    IF NOT (OLD.direccion <=> NEW.direccion) THEN
+      SET v_cambios = JSON_MERGE_PATCH(v_cambios, JSON_OBJECT('direccion', JSON_OBJECT('antes', OLD.direccion, 'despues', NEW.direccion)));
     END IF;
     IF NOT (OLD.notas <=> NEW.notas) THEN
       SET v_cambios = JSON_MERGE_PATCH(v_cambios, JSON_OBJECT('notas', JSON_OBJECT('antes', OLD.notas, 'despues', NEW.notas)));

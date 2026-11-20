@@ -18,6 +18,7 @@ import {
   type Config,
 } from "@/lib/queries";
 import { showErrorDialog } from "@/components/ErrorDialog";
+import { Paginacion, usePaginacion } from "@/components/portal/Paginacion";
 import type { Sociedad, Role, CorreoSimulado } from "@/lib/store";
 import { Switch } from "@/components/ui/switch";
 import { Modal } from "./_portal.solicitar";
@@ -116,12 +117,15 @@ function ListaPalabras({
 // se guardan en una tabla `logs`.
 function BitacoraNotificaciones() {
   const correos = lista(useCorreos().data);
-  const logs = lista(useLogs({ limit: 25 }).data);
+  // Los últimos 500 eventos (el servidor acepta hasta 1000), paginados en la tabla.
+  const logs = lista(useLogs({ limit: 500 }).data);
   const users = lista(useUsuarios().data);
   const [correo, setCorreo] = useState<CorreoSimulado | null>(null);
   const nombre = (id: string | null) => users.find((u) => u.id === id)?.nombre ?? "—";
   const fh = (iso: string) => new Date(iso).toLocaleString("es-MX", { dateStyle: "short", timeStyle: "short" });
-  const ultimosLogs = [...logs].sort((a, b) => b.fecha.localeCompare(a.fecha)).slice(0, 25);
+  const ultimosLogs = [...logs].sort((a, b) => b.fecha.localeCompare(a.fecha));
+  const { visibles: paginaCorreos, paginacion: pagCorreos } = usePaginacion(correos);
+  const { visibles: paginaLogs, paginacion: pagLogs } = usePaginacion(ultimosLogs);
 
   return (
     <div className="ckl-card p-5">
@@ -143,7 +147,7 @@ function BitacoraNotificaciones() {
             </tr>
           </thead>
           <tbody>
-            {correos.slice(0, 15).map((c) => (
+            {paginaCorreos.map((c) => (
               <tr
                 key={c.id}
                 className="cursor-pointer border-t hover:bg-secondary/50"
@@ -165,6 +169,7 @@ function BitacoraNotificaciones() {
           </tbody>
         </table>
       </div>
+      <Paginacion {...pagCorreos} />
 
       <div className="mt-5 text-sm font-semibold">Logs (últimos {ultimosLogs.length})</div>
       <div className="mt-2 overflow-x-auto rounded-lg border">
@@ -178,7 +183,7 @@ function BitacoraNotificaciones() {
             </tr>
           </thead>
           <tbody>
-            {ultimosLogs.map((l) => (
+            {paginaLogs.map((l) => (
               <tr key={l.id} className="border-t align-top">
                 <td className="whitespace-nowrap p-2">{fh(l.fecha)}</td>
                 <td className="p-2 font-mono">{l.tipo}</td>
@@ -198,6 +203,7 @@ function BitacoraNotificaciones() {
           </tbody>
         </table>
       </div>
+      <Paginacion {...pagLogs} />
 
       {correo && (
         <Modal onClose={() => setCorreo(null)}>

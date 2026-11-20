@@ -45,6 +45,10 @@ export type Hotel = {
   tarifa_doble?: number | null;
   // Presente cuando el hotel lo mantiene un convenio (ver sincronizarCatalogoConvenios).
   convenio_clave?: string;
+  // Contacto del convenio vigente, para reservar (ficha del hotel en Solicitar).
+  telefono?: string;
+  correo?: string;
+  direccion?: string;
 };
 
 export type TipoHabitacion = "sencilla" | "doble";
@@ -150,6 +154,61 @@ export function estatusVisible(estatus: string, comprobado: boolean): EstatusVis
   return "Pendiente";
 }
 
+// ───────── Autorización y "requieren mi acción" ─────────
+/**
+ * Paso de autorización que `userId` puede dar al folio ("jefe" | "finanzas") o false.
+ * Nadie autoriza su propia solicitud. El paso de jefe no depende del monto; el umbral solo decide si además
+ * hace falta Finanzas (exigir monto ≤ umbral al jefe dejaba sin autorizador las solicitudes de monto alto).
+ */
+export function pasoAutorizacion(
+  s: Pick<Solicitud, "estatus" | "user_id" | "jefe_status" | "finanzas_status" | "monto_total">,
+  userId: string | undefined,
+  permisos: Record<string, boolean> | undefined,
+  umbral: number,
+): "jefe" | "finanzas" | false {
+  if (!permisos || s.estatus !== "Abierto" || s.user_id === userId) return false;
+  if (permisos.autorizar_lte5000 && s.jefe_status === "Pendiente") return "jefe";
+  if (
+    permisos.autorizar_gt5000 &&
+    s.monto_total > umbral &&
+    s.jefe_status === "Autorizado" &&
+    s.finanzas_status === "Pendiente"
+  )
+    return "finanzas";
+  return false;
+}
+
+/**
+ * Filtro por omisión de Estatus ("Requieren mi acción"): lo que el usuario tiene que atender hoy.
+ *  - Quien autoriza (jefe, Finanzas): folios que le toca autorizar.
+ *  - Compras (validar_comprobacion): folios comprobados al 100 % que aún no valida.
+ *  - Finanzas / Compras (compensar_viaje): folios comprobados y validados que falta compensar.
+ *  - Dueño del folio: sus folios pendientes de autorizar y los autorizados que falta comprobar.
+ * Los comprobados, rechazados, ya validados y compensados quedan fuera (se ven eligiendo otro filtro).
+ */
+export function requiereAccion(
+  s: Pick<Solicitud, "estatus" | "user_id" | "jefe_status" | "finanzas_status" | "monto_total">,
+  ctx: {
+    userId: string | undefined;
+    permisos: Record<string, boolean> | undefined;
+    umbral: number;
+    comprobado: boolean;
+    validado: boolean;
+    compensado: boolean;
+  },
+): boolean {
+  const { userId, permisos, umbral, comprobado, validado, compensado } = ctx;
+  if (compensado) return false; // viaje cerrado: ya no requiere acción de nadie
+  if (pasoAutorizacion(s, userId, permisos, umbral)) return true;
+  if (permisos?.validar_comprobacion && s.estatus === "Cerrado" && comprobado && !validado) return true;
+  if (permisos?.compensar_viaje && s.estatus === "Cerrado" && comprobado && validado) return true;
+  if (s.user_id === userId) {
+    if (s.estatus === "Abierto") return true;
+    if (s.estatus === "Cerrado" && !comprobado) return true;
+  }
+  return false;
+}
+
 // ───────── Nueva solicitud: folios sin comprobar ─────────
 // Un usuario con este número (o más) de folios autorizados (Cerrado) y sin
 // comprobar por completo no puede generar una nueva solicitud hasta concluir
@@ -222,6 +281,49 @@ export function avanceValidacion(comprobantes: ComprobanteGasto[], solicitudId: 
 // distinto al predeterminado del catálogo, se abre una revisión para Compras
 // (campanita del portal + correo informativo). Compras la acepta o rechaza con un
 // comentario; la revisión resuelta se oculta de su lista al día siguiente.
+// ───────── Compensar viaje (Finanzas / Compras) ─────────
+// Cierre del viaje: con el folio comprobado al 100 % y validado por Compras se decide si se reembolsa al viajero
+// lo que gastó de más (facturas por encima de lo solicitado). Un folio compensado queda congelado y sale de las
+// vistas por omisión.
+export type DecisionCompensacion = "reembolsar" | "no_reembolsar" | "sin_excedente";
+
+export type Compensacion = {
+  id: string;
+  solicitud_id: string;
+  decision: DecisionCompensacion;
+  monto_solicitado: number;
+  monto_comprobado: number;
+  monto_excedente: number;
+  monto_reembolso: number;
+  comentario?: string;
+  compensado_por: string;
+  compensado_at: string; // ISO con hora
+};
+
+export type ResumenCompensacion = {
+  conceptos: {
+    id: string;
+    concepto: string;
+    solicitado: number;
+    comprobado: number;
+    facturado: number;
+    excedente: number;
+    validado: boolean;
+  }[];
+  solicitado: number;
+  comprobado: number;
+  facturado: number;
+  excedente: number;
+  comprobadoCompleto: boolean;
+  validadoCompleto: boolean;
+};
+
+export const DECISION_COMPENSACION: Record<DecisionCompensacion, string> = {
+  reembolsar: "Se reembolsa el excedente",
+  no_reembolsar: "No se reembolsa el excedente",
+  sin_excedente: "Sin gasto excedente",
+};
+
 export type RevisionMontoManual = {
   id: string;
   solicitud_id: string;
@@ -335,6 +437,7 @@ export type Convenio = {
   contacto: string;
   banco: string;
   correo: string;
+  direccion?: string; // dirección del hotel (ficha al solicitar)
   notas: string;
   activo: boolean;
   baja_motivo?: string;

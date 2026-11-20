@@ -6,6 +6,8 @@ import { useAuth } from "@/lib/auth";
 import { api } from "@/lib/api";
 import { lista, useApiMutation, useConvenios, useLogs, useUsuarios } from "@/lib/queries";
 import { showErrorDialog } from "@/components/ErrorDialog";
+import { Paginacion, usePaginacion } from "@/components/portal/Paginacion";
+import { ImportarConvenios } from "@/components/portal/ImportarConvenios";
 import { ESTADOS_MX, type Convenio, type LogEvento } from "@/lib/store";
 
 export const Route = createFileRoute("/_portal/convenios")({
@@ -36,6 +38,7 @@ const ETIQUETA_CAMPO: Record<string, string> = {
   contacto: "Contacto",
   banco: "Banco",
   correo: "Correo",
+  direccion: "Dirección",
   notas: "Notas",
 };
 const CAMPOS_EDITABLES = Object.keys(ETIQUETA_CAMPO) as (keyof Convenio)[];
@@ -65,6 +68,7 @@ function vacio(): Convenio {
     contacto: "",
     banco: "",
     correo: "",
+    direccion: "",
     notas: "",
     activo: true,
     creado_at: ahora,
@@ -83,7 +87,8 @@ function Convenios() {
   const [q, setQ] = useState("");
   const [destino, setDestino] = useState("Todos");
   const [anio, setAnio] = useState("Todos");
-  const [estatus, setEstatus] = useState("Todos");
+  // Por omisión solo los convenios vigentes (año en curso); los históricos y bajas se ven con el filtro.
+  const [estatus, setEstatus] = useState("Vigentes");
   const [edit, setEdit] = useState<Convenio | null>(null);
   const [baja, setBaja] = useState<Convenio | null>(null);
 
@@ -125,6 +130,7 @@ function Convenios() {
           a.nombre_comercial.localeCompare(b.nombre_comercial),
       );
   }, [convenios, q, destino, anio, estatus]);
+  const { visibles: paginaConvenios, paginacion } = usePaginacion(filtrados);
 
   const cuerpo = (c: Convenio) => ({
     anio: c.anio,
@@ -141,6 +147,7 @@ function Convenios() {
     contacto: c.contacto,
     banco: c.banco,
     correo: c.correo,
+    direccion: c.direccion ?? "",
     notas: c.notas,
   });
   const alta = useApiMutation((c: Convenio) => api.post("/convenios", cuerpo(c)), {
@@ -207,6 +214,7 @@ function Convenios() {
       contacto: c.contacto.trim(),
       banco: c.banco.trim(),
       correo: c.correo.trim(),
+      direccion: (c.direccion ?? "").trim(),
       notas: c.notas.trim(),
     };
 
@@ -327,15 +335,18 @@ function Convenios() {
             ))}
           </select>
         </div>
-        <button onClick={() => setEdit(vacio())} className="ckl-btn-primary">
-          <Plus size={14} /> Nuevo convenio
-        </button>
+        <div className="flex flex-wrap gap-2">
+          <ImportarConvenios convenios={convenios} />
+          <button onClick={() => setEdit(vacio())} className="ckl-btn-primary">
+            <Plus size={14} /> Nuevo convenio
+          </button>
+        </div>
       </div>
 
       <div className="ckl-card overflow-hidden">
         {/* Móvil (< 768 px): tarjetas apiladas */}
         <ul className="divide-y md:hidden">
-          {filtrados.map((c) => (
+          {paginaConvenios.map((c) => (
             <li key={c.id} className="space-y-1.5 p-3">
               <div className="flex items-start justify-between gap-2">
                 <div className="min-w-0">
@@ -397,7 +408,7 @@ function Convenios() {
               </tr>
             </thead>
             <tbody>
-              {filtrados.map((c) => (
+              {paginaConvenios.map((c) => (
                 <tr
                   key={c.id}
                   className="border-t align-top"
@@ -433,6 +444,7 @@ function Convenios() {
             </tbody>
           </table>
         </div>
+        <Paginacion {...paginacion} className="border-t px-3" />
         <div className="border-t bg-secondary p-2 text-[11px] text-muted-foreground">
           {filtrados.length} de {convenios.length} convenio(s). Solo los convenios <b>vigentes</b> (año{" "}
           {ANIO_ACTUAL}) se ofrecen en Solicitar viáticos; los de años anteriores se conservan como
@@ -555,6 +567,7 @@ function ConvenioForm({
           {texto("telefono", "Teléfono")}
           {texto("contacto", "Contacto")}
           {texto("correo", "Correo", "sm:col-span-2")}
+          {texto("direccion", "Dirección (calle, número, colonia, ciudad)", "sm:col-span-2")}
           <div className="sm:col-span-2">
             <label className="ckl-label">Notas</label>
             <textarea

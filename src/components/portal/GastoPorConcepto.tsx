@@ -4,6 +4,7 @@ import { ChevronRight, FileSpreadsheet } from "lucide-react";
 import * as XLSX from "xlsx";
 import { toast } from "sonner";
 import { useAuth } from "@/lib/auth";
+import { Paginacion, usePaginacion } from "@/components/portal/Paginacion";
 import { lista, useCatalogos, useRenglonesGasto as useRenglonesApi, useUsuarios } from "@/lib/queries";
 import {
   CATEGORIAS_GASTO,
@@ -307,6 +308,9 @@ export function ReporteGasto() {
     return arr;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filtrados, agrupar, base, users]);
+  // La tabla se pagina (el ranking sigue siendo global); la exportación a Excel usa todas las filas.
+  const { visibles: paginaFilas, paginacion } = usePaginacion(filas);
+  const inicioPagina = (paginacion.pagina - 1) * paginacion.porPagina;
 
   const datosDona = useMemo(() => totalesPorCategoria(filtrados, base), [filtrados, base]);
   const porUsuario = useMemo(() => {
@@ -461,9 +465,9 @@ export function ReporteGasto() {
               </tr>
             </thead>
             <tbody>
-              {filas.map((g, i) => (
+              {paginaFilas.map((g, i) => (
                 <tr key={g.claves.join("|")} className="border-t">
-                  <td className="p-3 text-xs text-muted-foreground">{i + 1}</td>
+                  <td className="p-3 text-xs text-muted-foreground">{inicioPagina + i + 1}</td>
                   {g.claves.map((k, j) => (
                     <td key={j} className="p-3">
                       {cols[j] === "Concepto" && COLOR_CATEGORIA[k as CategoriaGasto] ? (
@@ -516,6 +520,7 @@ export function ReporteGasto() {
             </tbody>
           </table>
         </div>
+        <Paginacion {...paginacion} className="border-t px-3" />
       </div>
     </div>
   );

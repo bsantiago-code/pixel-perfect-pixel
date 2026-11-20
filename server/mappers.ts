@@ -105,6 +105,7 @@ export function convenioOut(r: R) {
     contacto: r.contacto,
     banco: r.banco,
     correo: r.correo,
+    direccion: r.direccion ?? "",
     notas: r.notas ?? "",
     activo: !!r.activo,
     creado_at: iso(r.creado_at),
@@ -153,6 +154,10 @@ export function hotelOut(r: R) {
   };
   if (r.tarifa_doble != null) out.tarifa_doble = r.tarifa_doble;
   if (r.convenio_clave) out.convenio_clave = r.convenio_clave;
+  // Datos de contacto del convenio vigente (solo vienen en el catálogo; ver GET /catalogos).
+  if (r.conv_telefono) out.telefono = r.conv_telefono;
+  if (r.conv_correo) out.correo = r.conv_correo;
+  if (r.conv_direccion) out.direccion = r.conv_direccion;
   return out;
 }
 

@@ -6,7 +6,9 @@ import { api, reportApiError } from "./api";
 import { PALABRAS_DEFAULT } from "./palabras-prohibidas";
 import type {
   Autorizacion,
+  Compensacion,
   ComprobanteGasto,
+  ResumenCompensacion,
   Convenio,
   CorreoSimulado,
   Factura,
@@ -156,6 +158,21 @@ export const useBloqueoNuevaSolicitud = (enabled = true) =>
     queryFn: () => api.get<Bloqueo>("/solicitudes/bloqueo"),
     enabled,
     refetchInterval: POLL_MS,
+  });
+
+// Compensaciones de los folios del alcance del usuario (marca "Compensado" en Estatus y Comprobación).
+export const useCompensaciones = () =>
+  useQuery({ queryKey: ["compensaciones"], queryFn: () => api.get<Compensacion[]>("/compensaciones") });
+
+// Resumen por concepto (solicitado / comprobado / facturado / excedente) y la compensación, si ya existe.
+export const useResumenCompensacion = (solicitudId: string | null | undefined) =>
+  useQuery({
+    queryKey: ["compensacion", solicitudId],
+    queryFn: () =>
+      api.get<{ resumen: ResumenCompensacion; compensacion: Compensacion | null }>(
+        `/solicitudes/${solicitudId}/compensacion`,
+      ),
+    enabled: !!solicitudId,
   });
 
 export const useFacturas = (solicitudId: string | null | undefined) =>

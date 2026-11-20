@@ -18,6 +18,7 @@ const MODULOS: { key: string; label: string }[] = [
   { key: "validar_comprobacion", label: "Validar comprobaciones" },
   { key: "revisar_monto_manual", label: "Revisar montos manuales de hotel" },
   { key: "gestionar_convenios", label: "Gestionar convenios con hoteles" },
+  { key: "compensar_viaje", label: "Compensar viaje (cierre y reembolso de excedente)" },
   { key: "ver_gasto_por_concepto", label: "Ver gasto por concepto (Dashboard y reporte)" },
   { key: "ver_equipo", label: "Ver equipo" },
   { key: "ver_todo", label: "Ver todo" },

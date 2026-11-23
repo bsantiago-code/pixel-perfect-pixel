@@ -67,7 +67,7 @@ export async function crearRevisionesMontoManual(
   solicitante: AuthUser,
 ) {
   const hoteles = await rows<R>("SELECT id, nombre, tarifa_base, tarifa_doble FROM hoteles", [], c);
-  const existentes = await rows<R>("SELECT * FROM revisiones_monto WHERE solicitud_id = ?", [sol.id], c);
+  const existentes = await rows<R>("SELECT * FROM revisiones_monto WHERE solicitud_id = ?", [sol.folio], c);
   const resueltas = existentes.filter((r) => r.estado !== "pendiente");
   const previas = existentes.filter((r) => r.estado === "pendiente");
 
@@ -128,7 +128,7 @@ export async function crearRevisionesMontoManual(
   await exec(
     `DELETE FROM revisiones_monto WHERE solicitud_id = ? AND estado = 'pendiente'
        ${idsConservadas.length ? "AND id NOT IN (?)" : ""}`,
-    idsConservadas.length ? [sol.id, idsConservadas] : [sol.id],
+    idsConservadas.length ? [sol.folio, idsConservadas] : [sol.folio],
     c,
   );
   for (const x of conservadas) await exec("UPDATE revisiones_monto SET motivo = ? WHERE id = ?", [x.motivo, x.id], c);
@@ -138,7 +138,7 @@ export async function crearRevisionesMontoManual(
   await exec(
     `UPDATE revisiones_monto SET vigente = ${idsVigentes.length ? "(id IN (?))" : "0"}
       WHERE solicitud_id = ?`,
-    idsVigentes.length ? [idsVigentes, sol.id] : [sol.id],
+    idsVigentes.length ? [idsVigentes, sol.folio] : [sol.folio],
     c,
   );
 
@@ -169,7 +169,7 @@ export async function crearRevisionesMontoManual(
          hotel_nombre, tipo_habitacion, tarifa_default, monto_manual, motivo, noches, fecha_inicio, fecha_fin,
          creada_at, estado, vigente)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(3), 'pendiente', 1)`,
-      [n.id, sol.id, sol.folio, solicitante.id, n.destino_estado, n.hotel_stay_id, n.hotel_id, n.hotel_nombre,
+      [n.id, sol.folio, sol.folio, solicitante.id, n.destino_estado, n.hotel_stay_id, n.hotel_id, n.hotel_nombre,
         n.tipo_habitacion, n.tarifa_default, n.monto_manual, n.motivo ?? null, n.noches, n.fecha_inicio, n.fecha_fin],
       c,
     );

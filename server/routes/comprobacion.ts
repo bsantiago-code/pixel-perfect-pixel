@@ -8,7 +8,7 @@ import { me, requireAuth, requirePerm } from "../auth.ts";
 import { exec, newId, one, rows, tx } from "../db.ts";
 import { bad, forbidden, HttpError, notFound } from "../http.ts";
 import { comprobanteOut, facturaOut } from "../mappers.ts";
-import { exigirAlcance } from "../services/solicitudes.ts";
+import { exigirAlcance, exigirAlcancePorFolio } from "../services/solicitudes.ts";
 import { almacenActivo, almacenDeRef, AlmacenError, mimePorNombre, type Almacen } from "../storage/index.ts";
 import { cargarListasProhibidas } from "./admin.ts";
 import { exigirNoCompensado } from "./compensaciones.ts";
@@ -40,10 +40,8 @@ async function quitarArchivos(refs: string[]) {
 /** Folio y concepto donde ya está cargado un XML con ese UUID (o null si no se ha cargado). */
 async function xmlYaCargado(uuid: string) {
   return one<R>(
-    `SELECT s.folio, cg.concepto
+    `SELECT f.solicitud_id AS folio, f.concepto
        FROM facturas f
-       JOIN solicitudes s ON s.id = f.solicitud_id
-       LEFT JOIN comprobantes_gasto cg ON cg.id = f.concepto_id
       WHERE f.tipo = 'XML' AND f.uuid = ?
       LIMIT 1`,
     [uuid],
@@ -64,10 +62,11 @@ const upload = multer({
 comprobacionRouter.get("/facturas", async (req, res) => {
   const solicitudId = typeof req.query.solicitud_id === "string" ? req.query.solicitud_id : "";
   if (!solicitudId) throw bad("Indica la solicitud.");
-  await exigirAlcance(me(req), solicitudId);
+  // La URL usa el id interno de la solicitud; en la tabla facturas.solicitud_id es el folio.
+  const sol = await exigirAlcance(me(req), solicitudId);
   const list = await rows<R>(
     "SELECT * FROM facturas WHERE solicitud_id = ? ORDER BY created_at DESC, id",
-    [solicitudId],
+    [sol.folio],
   );
   res.json(list.map(facturaOut));
 });
@@ -81,7 +80,7 @@ comprobacionRouter.get("/facturas/:id/archivo", async (req, res) => {
     [req.params.id],
   );
   if (!f) throw notFound("El archivo no existe.");
-  await exigirAlcance(me(req), String(f.solicitud_id));
+  await exigirAlcancePorFolio(me(req), String(f.solicitud_id));
   let contenido: Buffer;
   let mime: string;
   if (f.ruta) {
@@ -105,7 +104,7 @@ comprobacionRouter.get("/facturas/:id/archivo", async (req, res) => {
 
 // ───────── subir comprobante (par XML + PDF; Vales: un solo archivo) ─────────
 comprobacionRouter.post(
-  "/comprobacion/renglones/:id/facturas",
+  "/comprobacion/renglones/:folio/:concepto/facturas",
   requirePerm("comprobar"),
   upload.fields([{ name: "xml", maxCount: 1 }, { name: "pdf", maxCount: 1 }]),
   async (req, res) => {
@@ -114,9 +113,12 @@ comprobacionRouter.post(
     const xml = files.xml?.[0];
     const pdf = files.pdf?.[0];
 
-    const reng = await one<R>("SELECT * FROM comprobantes_gasto WHERE id = ?", [req.params.id]);
+    const reng = await one<R>("SELECT * FROM comprobantes_gasto WHERE solicitud_id = ? AND concepto = ?", [
+      req.params.folio,
+      req.params.concepto,
+    ]);
     if (!reng) throw notFound("El renglón de comprobación no existe.");
-    const sol = await exigirAlcance(auth, String(reng.solicitud_id));
+    const sol = await exigirAlcancePorFolio(auth, String(reng.solicitud_id));
     if (sol.estatus !== "Cerrado") throw new HttpError(409, "Solo se comprueban solicitudes autorizadas.");
     await exigirNoCompensado(String(reng.solicitud_id));
     if (auth.role.nombre === "gestor_vuelos" && reng.concepto !== "Avión") {
@@ -217,7 +219,11 @@ comprobacionRouter.post(
     await tx(async (c) => {
       // Se bloquea el renglón para calcular el pendiente sin carreras.
       // (Si dos personas suben el mismo XML al mismo tiempo, el índice único uq_facturas_uuid_xml rechaza la segunda.)
-      const r = await one<R>("SELECT monto_solicitado, monto_comprobado, validado FROM comprobantes_gasto WHERE id = ? FOR UPDATE", [req.params.id], c);
+      const r = await one<R>(
+        "SELECT monto_solicitado, monto_comprobado, validado FROM comprobantes_gasto WHERE solicitud_id = ? AND concepto = ? FOR UPDATE",
+        [reng.solicitud_id, reng.concepto],
+        c,
+      );
       const pendiente = Number(r!.monto_solicitado) - Number(r!.monto_comprobado);
       // Lo que exceda lo solicitado no suma al comprobado (tope = solicitado), pero la factura se guarda completa:
       // ese excedente se decide al "Compensar viaje" (reembolsar o no). Con el concepto ya cubierto, la factura
@@ -230,8 +236,8 @@ comprobacionRouter.post(
       // Una factura nueva en un concepto ya validado debe volver a revisarla Compras.
       if (Number(r!.validado)) {
         await exec(
-          "UPDATE comprobantes_gasto SET validado = 0, validado_por = NULL, validado_fecha = NULL WHERE id = ?",
-          [req.params.id],
+          "UPDATE comprobantes_gasto SET validado = 0, validado_por = NULL, validado_fecha = NULL WHERE solicitud_id = ? AND concepto = ?",
+          [reng.solicitud_id, reng.concepto],
           c,
         );
       }
@@ -240,9 +246,9 @@ comprobacionRouter.post(
       const insertar = async (f: Express.Multer.File, tipo: string, montoAplicado: number) => {
         const id = newId("f_");
         await exec(
-          `INSERT INTO facturas (id, solicitud_id, tipo, fecha, uuid, archivo, total, status, concepto_id, monto_aplicado, par_id, ruta)
+          `INSERT INTO facturas (id, solicitud_id, tipo, fecha, uuid, archivo, total, status, concepto, monto_aplicado, par_id, ruta)
            VALUES (?, ?, ?, CURDATE(), ?, ?, ?, 'Verificado', ?, ?, ?, ?)`,
-          [id, reng.solicitud_id, tipo, uuid, f.originalname, total, reng.id, montoAplicado, parId, refs.get(f) ?? null],
+          [id, reng.solicitud_id, tipo, uuid, f.originalname, total, reng.concepto, montoAplicado, parId, refs.get(f) ?? null],
           c,
         );
         // Solo en modo BD el contenido va en factura_archivos; con almacén externo no se duplica.
@@ -266,7 +272,10 @@ comprobacionRouter.post(
       throw e;
     }
 
-    const r = await one<R>("SELECT * FROM comprobantes_gasto WHERE id = ?", [req.params.id]);
+    const r = await one<R>("SELECT * FROM comprobantes_gasto WHERE solicitud_id = ? AND concepto = ?", [
+      reng.solicitud_id,
+      reng.concepto,
+    ]);
     res.status(201).json({ renglon: comprobanteOut(r!), uuid, total, excedente });
   },
 );
@@ -276,7 +285,7 @@ comprobacionRouter.delete("/comprobacion/facturas/:key", requirePerm("comprobar"
   const auth = me(req);
   const items = await rows<R>("SELECT id, solicitud_id, ruta FROM facturas WHERE par_id = ? OR id = ?", [req.params.key, req.params.key]);
   if (!items.length) throw notFound("El comprobante no existe.");
-  await exigirAlcance(auth, String(items[0].solicitud_id));
+  await exigirAlcancePorFolio(auth, String(items[0].solicitud_id));
   await exigirNoCompensado(String(items[0].solicitud_id));
   await tx((c) => exec("DELETE FROM facturas WHERE par_id = ? OR id = ?", [req.params.key, req.params.key], c), auth.user.id);
   // Ya sin la fila en BD: los archivos físicos van a la papelera (mejor esfuerzo; un fallo no rompe la baja).
@@ -285,12 +294,15 @@ comprobacionRouter.delete("/comprobacion/facturas/:key", requirePerm("comprobar"
 });
 
 // ───────── validación de Compras Corporativas ─────────
-comprobacionRouter.patch("/comprobacion/renglones/:id/validacion", requirePerm("validar_comprobacion"), async (req, res) => {
+comprobacionRouter.patch("/comprobacion/renglones/:folio/:concepto/validacion", requirePerm("validar_comprobacion"), async (req, res) => {
   const auth = me(req);
   const body = z.object({ validado: z.boolean().optional(), nota: z.string().optional() }).parse(req.body);
-  const r = await one<R>("SELECT * FROM comprobantes_gasto WHERE id = ?", [req.params.id]);
+  const r = await one<R>("SELECT * FROM comprobantes_gasto WHERE solicitud_id = ? AND concepto = ?", [
+    req.params.folio,
+    req.params.concepto,
+  ]);
   if (!r) throw notFound("El renglón no existe.");
-  await exigirAlcance(auth, String(r.solicitud_id));
+  await exigirAlcancePorFolio(auth, String(r.solicitud_id));
   await exigirNoCompensado(String(r.solicitud_id));
 
   const sets: string[] = [];
@@ -308,6 +320,16 @@ comprobacionRouter.patch("/comprobacion/renglones/:id/validacion", requirePerm("
     sets.push("nota_validacion = ?");
     params.push(body.nota.trim() || null);
   }
-  if (sets.length) await exec(`UPDATE comprobantes_gasto SET ${sets.join(", ")} WHERE id = ?`, [...params, req.params.id]);
-  res.json(comprobanteOut((await one<R>("SELECT * FROM comprobantes_gasto WHERE id = ?", [req.params.id]))!));
+  if (sets.length) {
+    await exec(`UPDATE comprobantes_gasto SET ${sets.join(", ")} WHERE solicitud_id = ? AND concepto = ?`, [
+      ...params,
+      r.solicitud_id,
+      r.concepto,
+    ]);
+  }
+  res.json(
+    comprobanteOut(
+      (await one<R>("SELECT * FROM comprobantes_gasto WHERE solicitud_id = ? AND concepto = ?", [r.solicitud_id, r.concepto]))!,
+    ),
+  );
 });

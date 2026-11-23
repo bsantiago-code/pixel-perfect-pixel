@@ -88,17 +88,18 @@ export type Solicitud = {
 };
 
 export type Autorizacion = {
-  id: string;
+  /** Folio de la solicitud (`Solicitud.folio`), no su id interno. Llave: (solicitud_id, user_id). */
   solicitud_id: string;
   rol_autorizador: string;
   user_id: string;
+  user_nombre: string;
   status: "autorizado" | "rechazado";
   fecha: string;
   nota: string;
 };
 
 export type ComprobanteGasto = {
-  id: string;
+  /** Folio de la solicitud (`Solicitud.folio`). Llave del renglón: (solicitud_id, concepto). */
   solicitud_id: string;
   concepto: string;
   monto_solicitado: number;
@@ -135,11 +136,11 @@ export const ESTATUS_VISIBLES: EstatusVisible[] = [
 // `soloAvion` limita el cálculo al concepto "Avión" (vista del gestor de vuelos).
 export function avanceComprobacion(
   comprobantes: ComprobanteGasto[],
-  solicitudId: string,
+  folio: string, // Solicitud.folio (ComprobanteGasto.solicitud_id guarda el folio)
   soloAvion = false,
 ) {
   const filas = comprobantes
-    .filter((c) => c.solicitud_id === solicitudId)
+    .filter((c) => c.solicitud_id === folio)
     .filter((c) => !soloAvion || c.concepto === "Avión");
   const solicitado = filas.reduce((a, r) => a + r.monto_solicitado, 0);
   const comprobado = filas.reduce((a, r) => a + r.monto_comprobado, 0);
@@ -224,7 +225,7 @@ export function foliosSinComprobar(
     (s) =>
       s.user_id === userId &&
       s.estatus === "Cerrado" &&
-      !avanceComprobacion(comprobantes, s.id).completo,
+      !avanceComprobacion(comprobantes, s.folio).completo,
   );
 }
 
@@ -256,9 +257,9 @@ export function evaluarContrasena(nueva: string, user: Pick<User, "correo" | "no
 // comprobado por completo sean reales (casilla "Validado" + "Nota" opcional).
 // Solo cuentan los renglones con monto solicitado > 0 (un renglón en $0 no tiene
 // factura que validar).
-export function avanceValidacion(comprobantes: ComprobanteGasto[], solicitudId: string) {
+export function avanceValidacion(comprobantes: ComprobanteGasto[], folio: string) {
   const filas = comprobantes.filter(
-    (c) => c.solicitud_id === solicitudId && c.monto_solicitado > 0,
+    (c) => c.solicitud_id === folio && c.monto_solicitado > 0,
   );
   const validados = filas.filter((c) => c.validado).length;
   return {
@@ -302,7 +303,6 @@ export type Compensacion = {
 
 export type ResumenCompensacion = {
   conceptos: {
-    id: string;
     concepto: string;
     solicitado: number;
     comprobado: number;
@@ -398,12 +398,12 @@ export function revisionVisible(r: RevisionMontoManual, hoy: string = hoyLocal()
 // solicitante edite la solicitud (la edición deja sin efecto la revisión rechazada);
 // aceptado → libre. Con el parámetro apagado (por omisión) nunca bloquea.
 export function bloqueoMontoHotel(
-  solicitudId: string,
+  folio: string, // Solicitud.folio (RevisionMontoManual.solicitud_id guarda el folio)
   revisiones: RevisionMontoManual[],
   config: { bloquear_folio_monto_hotel?: boolean },
 ): string | null {
   if (!config.bloquear_folio_monto_hotel) return null;
-  const vigentes = revisiones.filter((r) => r.solicitud_id === solicitudId && r.vigente !== false);
+  const vigentes = revisiones.filter((r) => r.solicitud_id === folio && r.vigente !== false);
   const rechazada = vigentes.find((r) => r.estado === "rechazado");
   if (rechazada) {
     return `Bloqueado: Compras rechazó el monto manual de hotel (${rechazada.hotel_nombre}). El solicitante debe editar la solicitud.`;
@@ -461,9 +461,9 @@ export type Factura = {
   archivo: string;
   total: number;
   status: "Verificado" | "Error" | "Incompleto";
-  // Renglón de comprobación al que se aplicó el monto y cuánto se aplicó (permite
-  // revertir exacto al eliminar).
-  concepto_id: string | null;
+  // Renglón de comprobación (solicitud_id + concepto) al que se aplicó el monto y cuánto se aplicó
+  // (permite revertir exacto al eliminar).
+  concepto: string | null;
   monto_aplicado: number;
   // El archivo vive en la BD; se abre con `url` (GET /api/facturas/:id/archivo).
   url?: string;

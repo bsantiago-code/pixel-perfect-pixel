@@ -163,7 +163,7 @@ function Solicitar() {
     const puedeEditar =
       found.user_id === user?.id &&
       found.estatus === "Abierto" &&
-      !detalle.autorizaciones.some((a) => a.solicitud_id === found.id);
+      !detalle.autorizaciones.some((a) => a.solicitud_id === found.folio);
     return puedeEditar ? found : null;
   }, [editId, detalle, user?.id]);
 

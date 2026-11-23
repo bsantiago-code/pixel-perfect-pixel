@@ -35,9 +35,9 @@ export function compensacionOut(r: R) {
   };
 }
 
-/** Lanza 409 si el folio ya fue compensado: sus facturas y validaciones quedan congeladas. */
-export async function exigirNoCompensado(solicitudId: string, db?: Db) {
-  const c = await one("SELECT 1 FROM compensaciones WHERE solicitud_id = ?", [solicitudId], db);
+/** Lanza 409 si el folio ya fue compensado: sus facturas y validaciones quedan congeladas. Recibe el FOLIO. */
+export async function exigirNoCompensado(folio: string, db?: Db) {
+  const c = await one("SELECT 1 FROM compensaciones WHERE solicitud_id = ?", [folio], db);
   if (c) throw new HttpError(409, "Este viaje ya fue compensado: ya no se pueden modificar sus comprobantes.");
 }
 
@@ -45,19 +45,19 @@ export async function exigirNoCompensado(solicitudId: string, db?: Db) {
  * Resumen por concepto: solicitado, comprobado (lo aplicado, con tope en lo solicitado), facturado (suma de los
  * totales de las facturas XML; en vales, lo aplicado) y excedente = facturado − comprobado.
  */
-export async function resumenCompensacion(solicitudId: string, db?: Db) {
+export async function resumenCompensacion(folio: string, db?: Db) {
   const renglones = await rows<R>(
-    `SELECT cg.id, cg.concepto, cg.monto_solicitado, cg.monto_comprobado, cg.validado,
+    `SELECT cg.concepto, cg.monto_solicitado, cg.monto_comprobado, cg.validado,
             -- XML: su Total completo. Vales (foto/PDF sin XML): solo lo aplicado, porque su importe aún es
             -- simulado y no debe generar excedente. El PDF de un par aplica 0.
             COALESCE(SUM(CASE WHEN f.tipo = 'XML' AND f.status <> 'Incompleto' THEN f.total
                               ELSE f.monto_aplicado END), 0) AS facturado
        FROM comprobantes_gasto cg
-       LEFT JOIN facturas f ON f.concepto_id = cg.id
+       LEFT JOIN facturas f ON f.solicitud_id = cg.solicitud_id AND f.concepto = cg.concepto
       WHERE cg.solicitud_id = ?
-      GROUP BY cg.id, cg.concepto, cg.monto_solicitado, cg.monto_comprobado, cg.validado
-      ORDER BY cg.id`,
-    [solicitudId],
+      GROUP BY cg.solicitud_id, cg.concepto, cg.seq, cg.monto_solicitado, cg.monto_comprobado, cg.validado
+      ORDER BY cg.seq`,
+    [folio],
     db,
   );
   const conceptos = renglones
@@ -67,7 +67,6 @@ export async function resumenCompensacion(solicitudId: string, db?: Db) {
       const comprobado = n(r.monto_comprobado);
       const facturado = n(r.facturado);
       return {
-        id: String(r.id),
         concepto: String(r.concepto),
         solicitado,
         comprobado,
@@ -94,7 +93,7 @@ export async function resumenCompensacion(solicitudId: string, db?: Db) {
 compensacionesRouter.get("/compensaciones", async (req, res) => {
   const alcance = scopeSolicitudes(me(req), false);
   const list = await rows<R>(
-    `SELECT c.* FROM compensaciones c JOIN solicitudes s ON s.id = c.solicitud_id WHERE ${alcance.sql}`,
+    `SELECT c.* FROM compensaciones c JOIN solicitudes s ON s.folio = c.solicitud_id WHERE ${alcance.sql}`,
     alcance.params,
   );
   res.json(list.map(compensacionOut));
@@ -102,10 +101,10 @@ compensacionesRouter.get("/compensaciones", async (req, res) => {
 
 // Resumen para el diálogo "Compensar viaje" y para el detalle del folio.
 compensacionesRouter.get("/solicitudes/:id/compensacion", async (req, res) => {
-  await exigirAlcance(me(req), String(req.params.id));
-  const c = await one<R>("SELECT * FROM compensaciones WHERE solicitud_id = ?", [req.params.id]);
+  const sol = await exigirAlcance(me(req), String(req.params.id));
+  const c = await one<R>("SELECT * FROM compensaciones WHERE solicitud_id = ?", [sol.folio]);
   res.json({
-    resumen: await resumenCompensacion(String(req.params.id)),
+    resumen: await resumenCompensacion(String(sol.folio)),
     compensacion: c ? compensacionOut(c) : null,
   });
 });
@@ -128,10 +127,10 @@ compensacionesRouter.post(
     const out = await tx(async (c) => {
       // Se bloquea la solicitud para que dos personas no compensen el mismo folio a la vez.
       await one("SELECT id FROM solicitudes WHERE id = ? FOR UPDATE", [req.params.id], c);
-      if (await one("SELECT 1 FROM compensaciones WHERE solicitud_id = ?", [req.params.id], c)) {
+      if (await one("SELECT 1 FROM compensaciones WHERE solicitud_id = ?", [sol.folio], c)) {
         throw new HttpError(409, `El viaje ${sol.folio} ya fue compensado.`);
       }
-      const r = await resumenCompensacion(String(req.params.id), c);
+      const r = await resumenCompensacion(String(sol.folio), c);
       if (!r.comprobadoCompleto) throw new HttpError(409, "El viaje aún no está comprobado al 100 %.");
       if (!r.validadoCompleto) throw new HttpError(409, "Compras aún no valida todos los conceptos del viaje.");
 
@@ -158,7 +157,7 @@ compensacionesRouter.post(
         `INSERT INTO compensaciones (id, solicitud_id, decision, monto_solicitado, monto_comprobado, monto_excedente,
                                      monto_reembolso, comentario, compensado_por)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [id, req.params.id, body.decision, r.solicitado, r.comprobado, r.excedente, reembolso, comentario, auth.user.id],
+        [id, sol.folio, body.decision, r.solicitado, r.comprobado, r.excedente, reembolso, comentario, auth.user.id],
         c,
       );
       await c.query("CALL sp_registrar_log(?, ?, ?, ?, ?)", [

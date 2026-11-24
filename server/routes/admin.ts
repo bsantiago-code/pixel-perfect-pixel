@@ -30,7 +30,20 @@ type R = Record<string, unknown>;
 adminRouter.get("/catalogos", async (_req, res) => {
   const [soc, hot, ori, est] = await Promise.all([
     rows<R>("SELECT * FROM sociedades ORDER BY id"),
-    rows<R>("SELECT * FROM hoteles ORDER BY id"),
+    // Cada hotel con los datos de contacto de su convenio vigente (activo, del año en curso; mismo criterio
+    // que sp_sincronizar_catalogo_convenios) para la ficha del hotel al solicitar viáticos.
+    rows<R>(
+      `SELECT h.*, v.telefono AS conv_telefono, v.correo AS conv_correo, v.direccion AS conv_direccion
+         FROM hoteles h
+         LEFT JOIN (
+           SELECT c.nombre_comercial, c.destino, c.telefono, c.correo, c.direccion,
+                  ROW_NUMBER() OVER (PARTITION BY c.nombre_comercial, c.destino
+                                     ORDER BY c.actualizado_at DESC, c.id DESC) AS rn
+             FROM convenios c
+            WHERE c.activo = 1 AND c.anio = YEAR(CURDATE())
+         ) v ON v.rn = 1 AND v.nombre_comercial = h.nombre AND v.destino = h.ciudad
+        ORDER BY h.id`,
+    ),
     rows<R>("SELECT nombre FROM origenes ORDER BY id"),
     rows<R>("SELECT nombre FROM estados_mx ORDER BY nombre"),
   ]);

@@ -7,6 +7,7 @@ import { bad, forbidden, HttpError, notFound } from "../http.ts";
 import { autorizacionOut, comprobanteOut, destinosDe, solicitudOut } from "../mappers.ts";
 import { scopeSolicitudes } from "../scope.ts";
 import { bloqueoNuevaSolicitud, exigirAlcance, guardarSolicitud } from "../services/solicitudes.ts";
+import { exigirNoCompensado } from "./compensaciones.ts";
 
 export const solicitudesRouter = Router();
 solicitudesRouter.use(requireAuth);
@@ -98,8 +99,34 @@ async function decidir(userId: string, solicitudId: string, decision: "autorizad
 
 solicitudesRouter.post("/solicitudes/:id/autorizar", async (req, res) => {
   const auth = me(req);
-  await exigirAlcance(auth, String(req.params.id));
-  res.json(await decidir(auth.user.id, req.params.id, "autorizado", null));
+  const { confirmo_hotel_manual } = z
+    .object({ confirmo_hotel_manual: z.boolean().optional() })
+    .parse(req.body ?? {});
+  const sol = await exigirAlcance(auth, String(req.params.id));
+  // Hoteles con monto manual distinto al del catálogo (cada uno abrió una revisión de Compras). Quien autoriza
+  // debe confirmarlo explícitamente en el aviso; sin la confirmación no se autoriza (no se puede omitir).
+  const manuales = await rows<R>(
+    "SELECT id, hotel_nombre, estado FROM revisiones_monto WHERE solicitud_id = ? AND vigente = 1",
+    [req.params.id],
+  );
+  if (manuales.length && !confirmo_hotel_manual) {
+    throw new HttpError(
+      409,
+      `El folio ${sol.folio} tiene hotel(es) con monto modificado manualmente. Revisa el aviso y confirma para autorizar.`,
+      "HOTEL_MANUAL_SIN_CONFIRMAR",
+    );
+  }
+  const out = await decidir(auth.user.id, req.params.id, "autorizado", null);
+  if (manuales.length) {
+    await exec("CALL sp_registrar_log(?, ?, ?, ?, ?)", [
+      "autorizacion_con_hotel_manual", "solicitud", req.params.id, auth.user.id,
+      JSON.stringify({
+        folio: sol.folio,
+        hoteles: manuales.map((m) => ({ hotel: m.hotel_nombre, revision_compras: m.estado })),
+      }),
+    ]);
+  }
+  res.json(out);
 });
 
 solicitudesRouter.post("/solicitudes/:id/rechazar", async (req, res) => {
@@ -112,6 +139,8 @@ solicitudesRouter.post("/solicitudes/:id/rechazar", async (req, res) => {
 
 solicitudesRouter.post("/solicitudes/:id/revertir", async (req, res) => {
   const { user } = me(req);
+  // Un viaje ya compensado está cerrado: revertir sus autorizaciones dejaría la compensación sin sentido.
+  await exigirNoCompensado(String(req.params.id));
   await withConn(user.id, (c) => c.query("CALL sp_revertir_autorizaciones(?, ?)", [req.params.id, user.id]));
   res.json(solicitudOut((await one<R>("SELECT * FROM solicitudes WHERE id = ?", [req.params.id]))!));
 });

@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 import {
   Upload,
   Paperclip,
+  Scale,
   Trash2,
   Eye,
   Download,
@@ -13,12 +14,15 @@ import {
 import { toast } from "sonner";
 import { useAuth } from "@/lib/auth";
 import { showErrorDialog } from "@/components/ErrorDialog";
+import { Paginacion, Paginado, usePaginacion } from "@/components/portal/Paginacion";
+import { CompensarViajeDialog, ResumenCompensado } from "@/components/portal/CompensarViajeDialog";
 import { api } from "@/lib/api";
 import {
   lista,
   useApiMutation,
   useComprobantes,
   useFacturas,
+  useCompensaciones,
   useSolicitudes,
   useUsuarios,
 } from "@/lib/queries";
@@ -102,11 +106,20 @@ function Comprobacion() {
   );
   const nav = useNavigate();
   const { solicitudId } = Route.useSearch();
+  // Folio que se abre sin uno elegido: el primero que falta atender (por comprobar, o por validar para
+  // Compras); si no hay, el primero de la lista.
+  const porDefecto = (
+    cerradas.find((s) =>
+      soloValidador
+        ? !avanceValidacion(comprobantes, s.id).completa
+        : !avanceComprobacion(comprobantes, s.id).completo,
+    ) ?? cerradas[0]
+  )?.id ?? "";
   const [sidState, setSid] = useState<string>(() =>
-    cerradas.some((c) => c.id === solicitudId) ? solicitudId! : (cerradas[0]?.id ?? ""),
+    cerradas.some((c) => c.id === solicitudId) ? solicitudId! : porDefecto,
   );
-  // Si el folio guardado ya no está en el alcance del usuario, cae al primero disponible.
-  const sid = cerradas.some((c) => c.id === sidState) ? sidState : (cerradas[0]?.id ?? "");
+  // Si el folio guardado ya no está en el alcance del usuario, cae al de por omisión.
+  const sid = cerradas.some((c) => c.id === sidState) ? sidState : porDefecto;
   // Si la URL trae (o cambia a) un solicitudId válido, ese folio queda seleccionado.
   useEffect(() => {
     if (solicitudId && cerradas.some((c) => c.id === solicitudId)) {
@@ -130,12 +143,17 @@ function Comprobacion() {
   const { data: facturasData } = useFacturas(sid || null);
   const fs = lista(facturasData);
   const [log, setLog] = useState<string[]>([]);
+  // Viaje compensado: sus comprobantes quedan congelados (sin subir, quitar ni validar).
+  const { data: compensacionesData } = useCompensaciones();
+  const compensacion = lista(compensacionesData).find((c) => c.solicitud_id === sid);
+  const compensado = !!compensacion;
+  const [compensando, setCompensando] = useState(false);
 
   const addLog = (line: string) =>
     setLog((l) => [`${new Date().toTimeString().slice(0, 8)} ${line}`, ...l].slice(0, 50));
 
   const subirMut = useApiMutation((v: { id: string; fd: FormData }) =>
-    api.post<{ renglon: unknown; uuid: string; total: number }>(
+    api.post<{ renglon: unknown; uuid: string; total: number; excedente: number }>(
       `/comprobacion/renglones/${v.id}/facturas`,
       v.fd,
     ),
@@ -177,9 +195,14 @@ function Comprobacion() {
       addLog(
         esVales
           ? `✔ Comprobante de vales cargado: ${archivos.pdf!.name}`
-          : `✔ XML + PDF verificados para "${concepto.concepto}". UUID: ${r.uuid} · Total ${fmtMoney(r.total)}`,
+          : `✔ XML + PDF verificados para "${concepto.concepto}". UUID: ${r.uuid} · Total ${fmtMoney(r.total)}` +
+              (r.excedente > 0 ? ` · ${fmtMoney(r.excedente)} por encima de lo solicitado (gasto excedente)` : ""),
       );
-      toast.success(`Comprobante de "${concepto.concepto}" cargado y verificado.`);
+      toast.success(
+        r.excedente > 0
+          ? `Comprobante de "${concepto.concepto}" cargado. ${fmtMoney(r.excedente)} quedan como gasto excedente: Finanzas/Compras decidirán si se reembolsa al compensar el viaje.`
+          : `Comprobante de "${concepto.concepto}" cargado y verificado.`,
+      );
       return true;
     } catch (e) {
       addLog(`✖ ${e instanceof Error ? e.message : "No se pudo cargar el comprobante"}`);
@@ -255,7 +278,8 @@ function Comprobacion() {
   const duenoDe = (s: Solicitud) => users.find((u) => u.id === s.user_id)?.nombre ?? "—";
   const nombreDe = (id?: string) => users.find((u) => u.id === id)?.nombre ?? "Compras";
   // Un renglón solo se puede validar cuando ya está comprobado por completo.
-  const validable = (r: ComprobanteGasto) => r.monto_solicitado > 0 && r.status_renglon === "comprobado";
+  const validable = (r: ComprobanteGasto) =>
+    !compensado && r.monto_solicitado > 0 && r.status_renglon === "comprobado";
 
   const celdaValidado = (r: ComprobanteGasto) => {
     if (validador && validable(r)) {
@@ -314,9 +338,27 @@ function Comprobacion() {
   };
 
   const botonesAdjuntar = (r: ComprobanteGasto) => {
-    const cerrado = r.status_renglon === "comprobado" || r.status_renglon === "no_aplica";
-    if (cerrado || !puedeComprobar) return <span className="text-xs text-muted-foreground">—</span>;
     const esVales = r.concepto === "Vales";
+    if (!puedeComprobar || compensado || r.status_renglon === "no_aplica") {
+      return <span className="text-xs text-muted-foreground">—</span>;
+    }
+    if (r.status_renglon === "comprobado") {
+      // Concepto ya cubierto: se puede registrar lo que se gastó de más (no suma al comprobado; se decide al
+      // compensar el viaje). Los vales no, porque aún no se captura su importe.
+      if (esVales || !(r.monto_solicitado > 0)) {
+        return <span className="text-xs text-muted-foreground">—</span>;
+      }
+      return (
+        <button
+          onClick={() => setAdjuntando(r)}
+          className="inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs font-medium text-muted-foreground hover:bg-secondary"
+          title="Registrar una factura por encima de lo solicitado (gasto excedente)"
+          aria-label={`Registrar gasto extra de ${r.concepto}`}
+        >
+          <Paperclip size={14} /> Gasto extra
+        </button>
+      );
+    }
     return (
       <button
         onClick={() => setAdjuntando(r)}
@@ -365,6 +407,28 @@ function Comprobacion() {
         <span className="text-sm font-semibold text-foreground">{sel.folio}</span> · {duenoDe(sel)} ·{" "}
         {sel.empresa} · {sel.tipo_viaje} · {sel.fecha}
       </div>
+
+      {compensacion && (
+        <ResumenCompensado c={compensacion} quien={nombreDe(compensacion.compensado_por)} />
+      )}
+      {!compensado && hasPerm("compensar_viaje") && comprobado && validacion.completa && (
+        <div
+          className="flex flex-wrap items-center justify-between gap-2 rounded-md border p-3 text-xs"
+          style={{ background: "#EEF2FF", borderColor: "#6366F1", color: "#3730A3" }}
+        >
+          <span>Este viaje ya está comprobado y validado por Compras: falta compensarlo.</span>
+          <button onClick={() => setCompensando(true)} className="ckl-btn-primary">
+            <Scale size={14} /> Compensar viaje
+          </button>
+        </div>
+      )}
+      {compensando && (
+        <CompensarViajeDialog
+          solicitud={sel}
+          onClose={() => setCompensando(false)}
+          onListo={() => setCompensando(false)}
+        />
+      )}
 
       {/* Tabla */}
       <div className="ckl-card overflow-hidden">
@@ -508,12 +572,15 @@ function Comprobacion() {
 
       <div className="ckl-card overflow-hidden">
         <div className="border-b p-4 text-sm font-semibold">Facturas cargadas</div>
+        <Paginado items={grupos} className="border-t px-3">
+          {(paginaGrupos) => (
+        <>
         {/* Móvil (< 768 px): tarjetas apiladas en lugar de tabla de 8 columnas. */}
         <ul className="divide-y md:hidden">
           {grupos.length === 0 && (
             <li className="p-6 text-center text-xs text-muted-foreground">Sin facturas</li>
           )}
-          {grupos.map((g) => {
+          {paginaGrupos.map((g) => {
             const f = g[0];
             const concepto = comprobantes.find((c) => c.id === f.concepto_id)?.concepto ?? "—";
             const est = estadoGrupo(g);
@@ -550,7 +617,7 @@ function Comprobacion() {
                   <span className="text-xs text-muted-foreground">
                     {f.fecha} · <b className="text-foreground">{fmtMoney(f.total)}</b>
                   </span>
-                  {puedeComprobar && (
+                  {puedeComprobar && !compensado && (
                     <button title="Eliminar" aria-label="Eliminar comprobante" className="rounded p-2 hover:bg-secondary" onClick={() => removeGrupo(g)}>
                       <Trash2 size={16} />
                     </button>
@@ -582,7 +649,7 @@ function Comprobacion() {
                   </td>
                 </tr>
               )}
-              {grupos.map((g) => {
+              {paginaGrupos.map((g) => {
                 const f = g[0];
                 const concepto = comprobantes.find((c) => c.id === f.concepto_id)?.concepto ?? "—";
                 const est = estadoGrupo(g);
@@ -625,7 +692,7 @@ function Comprobacion() {
                             </div>
                           ))}
                         </div>
-                        {puedeComprobar && (
+                        {puedeComprobar && !compensado && (
                           <button
                             title="Eliminar"
                             aria-label="Eliminar comprobante"
@@ -643,6 +710,9 @@ function Comprobacion() {
             </tbody>
           </table>
         </div>
+        </>
+          )}
+        </Paginado>
       </div>
 
       {!soloAvion && puedeComprobar && (
@@ -690,6 +760,10 @@ function Comprobacion() {
   );
 }
 
+// Opciones del filtro del panel de folios; la primera es la de por omisión (lo que falta atender).
+const FILTROS_COMPROBADOR = ["Pendientes por comprobar", "Comprobados", "Todos"];
+const FILTROS_VALIDADOR = ["Por validar", "Validados", "Todos"];
+
 // Panel maestro: tarjetas de folios con buscador y barra de avance de comprobación.
 // En móvil (< 1024 px) se colapsa al folio elegido y se despliega con "Cambiar folio".
 function FolioPicker({
@@ -711,15 +785,23 @@ function FolioPicker({
 }) {
   const [q, setQ] = useState("");
   const [open, setOpen] = useState(false);
+  // Filtro por omisión: solo lo que falta atender (por comprobar, o por validar para Compras).
+  const opcionesFiltro = soloValidador ? FILTROS_VALIDADOR : FILTROS_COMPROBADOR;
+  const [filtro, setFiltro] = useState<string>(opcionesFiltro[0]);
   const selected = solicitudes.find((s) => s.id === selectedId);
 
   const visibles = useMemo(() => {
     const t = q.trim().toLowerCase();
-    if (!t) return solicitudes;
-    return solicitudes.filter((s) =>
-      [s.folio, s.destino_resumen, s.fecha, s.empresa].some((v) => v.toLowerCase().includes(t)),
-    );
-  }, [solicitudes, q]);
+    return solicitudes.filter((s) => {
+      if (t && ![s.folio, s.destino_resumen, s.fecha, s.empresa].some((v) => v.toLowerCase().includes(t)))
+        return false;
+      const hecho = soloValidador ? validacionDe(s.id).completa : avanceDe(s.id).completo;
+      if (filtro === opcionesFiltro[0]) return !hecho; // Pendientes por comprobar / Por validar
+      if (filtro === opcionesFiltro[1]) return hecho; // Comprobados / Validados
+      return true;
+    });
+  }, [solicitudes, q, filtro, opcionesFiltro, soloValidador, avanceDe, validacionDe]);
+  const { visibles: paginaFolios, paginacion } = usePaginacion(visibles);
 
   const renderCard = (s: Solicitud) => {
     const a = avanceDe(s.id);
@@ -810,8 +892,18 @@ function FolioPicker({
             onChange={(e) => setQ(e.target.value)}
           />
         </div>
+        <select
+          className="ckl-input mt-2"
+          value={filtro}
+          onChange={(e) => setFiltro(e.target.value)}
+          aria-label="Mostrar folios"
+        >
+          {opcionesFiltro.map((o) => (
+            <option key={o}>{o}</option>
+          ))}
+        </select>
         <ul className="mt-3 max-h-80 space-y-2 overflow-y-auto pr-0.5 lg:max-h-[65vh]">
-          {visibles.map((s) => (
+          {paginaFolios.map((s) => (
             <li key={s.id}>
               <button
                 type="button"
@@ -826,9 +918,16 @@ function FolioPicker({
             </li>
           ))}
           {visibles.length === 0 && (
-            <li className="p-4 text-center text-xs text-muted-foreground">Sin resultados</li>
+            <li className="p-4 text-center text-xs text-muted-foreground">
+              {filtro === opcionesFiltro[0] && !q.trim()
+                ? soloValidador
+                  ? "No tienes folios por validar."
+                  : "No tienes folios pendientes por comprobar."
+                : "Sin resultados"}
+            </li>
           )}
         </ul>
+        <Paginacion {...paginacion} />
       </div>
     </aside>
   );

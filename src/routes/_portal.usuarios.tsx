@@ -6,6 +6,7 @@ import { useAuth } from "@/lib/auth";
 import { api } from "@/lib/api";
 import { lista, useApiMutation, useRoles, useUsuarios } from "@/lib/queries";
 import { showErrorDialog } from "@/components/ErrorDialog";
+import { Paginacion, usePaginacion } from "@/components/portal/Paginacion";
 import type { Role, User } from "@/lib/store";
 import { Modal } from "./_portal.solicitar";
 
@@ -33,6 +34,7 @@ function Usuarios() {
   const roles = lista(rolesData);
   const [edit, setEdit] = useState<User | null>(null);
   const [creating, setCreating] = useState(false);
+  const { visibles: paginaUsuarios, paginacion } = usePaginacion(users);
 
   const crear = useApiMutation((u: User) => api.post("/usuarios", u), {
     onSuccess: () => {
@@ -98,7 +100,7 @@ function Usuarios() {
       <div className="ckl-card overflow-hidden">
         {/* Móvil (< 768 px): tarjetas apiladas en lugar de tabla de 7 columnas. */}
         <ul className="divide-y md:hidden">
-          {users.map((u) => {
+          {paginaUsuarios.map((u) => {
             const rc = ROLE_COLORS[roleName(u.rol_id)] ?? ROLE_COLORS.usuario;
             const locked = !canModify(u);
             return (
@@ -145,7 +147,7 @@ function Usuarios() {
               <tr><th className="p-3">Nombre</th><th className="p-3">Correo</th><th className="p-3">Rol</th><th className="p-3">Empresa</th><th className="p-3">Jefe</th><th className="p-3">Viaje</th><th className="p-3">Activo</th><th className="p-3"></th></tr>
             </thead>
             <tbody>
-              {users.map((u) => {
+              {paginaUsuarios.map((u) => {
                 const rc = ROLE_COLORS[roleName(u.rol_id)] ?? ROLE_COLORS.usuario;
                 const locked = !canModify(u);
                 return (
@@ -194,6 +196,7 @@ function Usuarios() {
             </tbody>
           </table>
         </div>
+        <Paginacion {...paginacion} className="border-t px-3" />
       </div>
 
       {edit && <UserModal user={edit} roles={roles} users={users} onClose={() => { setEdit(null); setCreating(false); }} onSave={save} />}

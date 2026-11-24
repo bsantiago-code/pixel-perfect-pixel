@@ -5,6 +5,13 @@ import { me, requireAuth, requirePerm } from "../auth.ts";
 import { exec, newId, one, rows, tx, withConn } from "../db.ts";
 import { bad, forbidden, HttpError, notFound } from "../http.ts";
 import { convenioOut, day, revisionOut } from "../mappers.ts";
+import { scopeSolicitudes } from "../scope.ts";
+import {
+  COLUMNAS_OBLIGATORIAS,
+  MAX_FILAS_IMPORTACION,
+  PLANTILLA_CONVENIOS,
+} from "../../src/lib/importar-convenios.ts";
+import { ESTADOS_MX } from "../../src/lib/store.ts";
 
 export const comprasRouter = Router();
 comprasRouter.use(requireAuth);
@@ -27,6 +34,7 @@ const convenioSchema = z.object({
   contacto: z.string().default(""),
   banco: z.string().default(""),
   correo: z.string().trim().default(""),
+  direccion: z.string().trim().max(300, "La dirección admite hasta 300 caracteres.").default(""),
   notas: z.string().default(""),
 });
 
@@ -41,7 +49,7 @@ async function validarConvenio(c: z.infer<typeof convenioSchema>, excluirId: str
 
 const COLS = [
   "anio", "tipo_sucursal", "no_sucursal", "destino", "estado", "nombre_comercial", "costo_sencilla", "costo_doble",
-  "no_proveedor", "razon_social", "telefono", "contacto", "banco", "correo", "notas",
+  "no_proveedor", "razon_social", "telefono", "contacto", "banco", "correo", "direccion", "notas",
 ] as const;
 
 const sincronizar = (c: { query: (sql: string, p?: unknown[]) => Promise<unknown> }, userId: string) =>
@@ -66,6 +74,83 @@ comprasRouter.post("/convenios", requirePerm("gestionar_convenios"), async (req,
     await sincronizar(conn, user.id);
   }, user.id);
   res.status(201).json(convenioOut((await one<R>("SELECT * FROM convenios WHERE id = ?", [id]))!));
+});
+
+// ───────── carga masiva desde Excel (pestaña "Hoteles") ─────────
+// La pantalla lee el Excel y manda las filas ya convertidas (src/lib/importar-convenios.ts); aquí se valida de nuevo
+// cada fila. Mismo hotel + destino + año que uno existente → se actualiza (solo las columnas que trae el archivo, para
+// no borrar datos que el Excel no incluye); si no, alta. Todo en una transacción; las filas con error no se cargan.
+const CAMPOS_IMPORTABLES = PLANTILLA_CONVENIOS.map((p) => p.campo) as [string, ...string[]];
+comprasRouter.post("/convenios/importar", requirePerm("gestionar_convenios"), async (req, res) => {
+  const { user } = me(req);
+  const body = z
+    .object({
+      archivo: z.string().max(255).default(""),
+      columnas: z.array(z.enum(CAMPOS_IMPORTABLES)).min(1),
+      filas: z
+        .array(z.object({ fila: z.number().int(), datos: z.record(z.string(), z.unknown()) }))
+        .min(1, "El archivo no trae filas para cargar.")
+        .max(MAX_FILAS_IMPORTACION, `Se pueden cargar hasta ${MAX_FILAS_IMPORTACION} convenios por archivo.`),
+    })
+    .parse(req.body);
+  const faltan = COLUMNAS_OBLIGATORIAS.filter((c) => !body.columnas.includes(c));
+  if (faltan.length) throw bad(`Al archivo le faltan columnas obligatorias: ${faltan.join(", ")}.`);
+  const columnas = COLS.filter((k) => (body.columnas as string[]).includes(k));
+
+  const errores: { fila: number; motivo: string }[] = [];
+  const validas: { fila: number; c: z.infer<typeof convenioSchema> }[] = [];
+  for (const f of body.filas) {
+    const r = convenioSchema.safeParse(f.datos);
+    if (!r.success) {
+      errores.push({ fila: f.fila, motivo: r.error.issues[0]?.message ?? "Datos inválidos" });
+      continue;
+    }
+    if (!ESTADOS_MX.includes(r.data.estado)) {
+      errores.push({ fila: f.fila, motivo: `Estado no reconocido: “${r.data.estado}”` });
+      continue;
+    }
+    if (r.data.correo && !/^\S+@\S+\.\S+$/.test(r.data.correo)) {
+      errores.push({ fila: f.fila, motivo: "Correo con formato inválido" });
+      continue;
+    }
+    validas.push({ fila: f.fila, c: r.data });
+  }
+
+  let nuevos = 0;
+  let actualizados = 0;
+  if (validas.length) {
+    await tx(async (conn) => {
+      for (const { c } of validas) {
+        const existe = await one<R>(
+          "SELECT id FROM convenios WHERE anio = ? AND destino = ? AND nombre_comercial = ?",
+          [c.anio, c.destino, c.nombre_comercial],
+          conn,
+        );
+        if (existe) {
+          // El trigger trg_convenios_au registra en la bitácora qué cambió.
+          await exec(
+            `UPDATE convenios SET ${columnas.map((k) => `${k} = ?`).join(", ")} WHERE id = ?`,
+            [...columnas.map((k) => c[k] ?? null), existe.id],
+            conn,
+          );
+          actualizados++;
+        } else {
+          await exec(
+            `INSERT INTO convenios (id, ${COLS.join(", ")}, activo) VALUES (?, ${COLS.map(() => "?").join(", ")}, 1)`,
+            [newId("cv_"), ...COLS.map((k) => c[k] ?? null)],
+            conn,
+          );
+          nuevos++;
+        }
+      }
+      await sincronizar(conn, user.id);
+      await conn.query("CALL sp_registrar_log(?, ?, ?, ?, ?)", [
+        "convenios_importados", "convenio", "importacion_excel", user.id,
+        JSON.stringify({ archivo: body.archivo, nuevos, actualizados, con_error: errores.length }),
+      ]);
+    }, user.id);
+  }
+  res.json({ nuevos, actualizados, errores });
 });
 
 comprasRouter.put("/convenios/:id", requirePerm("gestionar_convenios"), async (req, res) => {
@@ -96,12 +181,19 @@ comprasRouter.post("/convenios/:id/reactivar", requirePerm("gestionar_convenios"
 
 // ───────── revisiones de monto manual de hotel ─────────
 comprasRouter.get("/revisiones-monto", async (req, res) => {
-  const { user, role } = me(req);
-  const revisor = !!role.permisos.revisar_monto_manual;
-  const list = await rows<R>(
-    `SELECT * FROM revisiones_monto ${revisor ? "" : "WHERE user_id = ?"} ORDER BY creada_at DESC`,
-    revisor ? [] : [user.id],
-  );
+  const auth = me(req);
+  const revisor = !!auth.role.permisos.revisar_monto_manual;
+  // Compras ve todas. Los demás ven las de los folios dentro de su alcance (las propias; el jefe, además las de
+  // su equipo; Finanzas, todas): quien autoriza necesita saber si el folio trae un hotel con monto manual y si
+  // está bloqueado. La campanita sigue siendo solo para Compras (se filtra en NotificationBell).
+  const alcance = scopeSolicitudes(auth, false);
+  const list = revisor
+    ? await rows<R>("SELECT * FROM revisiones_monto ORDER BY creada_at DESC")
+    : await rows<R>(
+        `SELECT r.* FROM revisiones_monto r JOIN solicitudes s ON s.id = r.solicitud_id
+          WHERE ${alcance.sql} ORDER BY r.creada_at DESC`,
+        alcance.params,
+      );
   res.json(list.map(revisionOut));
 });
 

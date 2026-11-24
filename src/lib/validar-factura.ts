@@ -65,6 +65,33 @@ export function extraerConceptos(xmlText: string): ConceptoCfdi[] {
   });
 }
 
+// Formato del UUID (folio fiscal) que asigna el SAT al timbrar: grupos 8-4-4-4-12. El SAT usa hexadecimal; se
+// aceptan letras y números para no rechazar los XML de ejemplo de db/schema.sql (p. ej. "S191A7C1-…").
+const FORMATO_UUID = /^[0-9A-Z]{8}-[0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{12}$/;
+
+/**
+ * UUID (folio fiscal) del Timbre Fiscal Digital del CFDI, en mayúsculas, o null si el XML no está timbrado.
+ * Es el identificador único de la factura ante el SAT: sirve para impedir que el mismo XML se compruebe dos veces,
+ * aunque se renombre el archivo o se suba en otra solicitud.
+ */
+export function extraerUuidCfdi(xmlText: string): string | null {
+  let doc: Nodo;
+  try {
+    doc = parser.parse(xmlText) as Nodo;
+  } catch {
+    return null;
+  }
+  const comprobante = (doc.Comprobante ?? {}) as Nodo;
+  // Un CFDI puede traer varios nodos Complemento (timbre, pagos, etc.); el timbre puede estar en cualquiera.
+  for (const complemento of comoLista(comprobante.Complemento)) {
+    for (const timbre of comoLista(complemento.TimbreFiscalDigital)) {
+      const uuid = String(timbre["@_UUID"] ?? "").trim().toUpperCase();
+      if (FORMATO_UUID.test(uuid)) return uuid;
+    }
+  }
+  return null;
+}
+
 // ───────── coincidencia de palabras ─────────
 const escapar = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 

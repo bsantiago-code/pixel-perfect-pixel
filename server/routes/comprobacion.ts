@@ -1,11 +1,9 @@
-import { randomUUID } from "node:crypto";
-
 import { Router } from "express";
 import multer from "multer";
 import { z } from "zod";
 
 import { conceptoRequierePar } from "../../src/lib/store.ts";
-import { validarContenidoFactura } from "../../src/lib/validar-factura.ts";
+import { extraerUuidCfdi, validarContenidoFactura } from "../../src/lib/validar-factura.ts";
 import { me, requireAuth, requirePerm } from "../auth.ts";
 import { exec, newId, one, rows, tx } from "../db.ts";
 import { bad, forbidden, HttpError, notFound } from "../http.ts";
@@ -13,6 +11,7 @@ import { comprobanteOut, facturaOut } from "../mappers.ts";
 import { exigirAlcance } from "../services/solicitudes.ts";
 import { almacenActivo, almacenDeRef, AlmacenError, mimePorNombre, type Almacen } from "../storage/index.ts";
 import { cargarListasProhibidas } from "./admin.ts";
+import { exigirNoCompensado } from "./compensaciones.ts";
 
 export const comprobacionRouter = Router();
 comprobacionRouter.use(requireAuth);
@@ -36,6 +35,24 @@ async function quitarArchivos(refs: string[]) {
       }
     }),
   );
+}
+
+/** Folio y concepto donde ya está cargado un XML con ese UUID (o null si no se ha cargado). */
+async function xmlYaCargado(uuid: string) {
+  return one<R>(
+    `SELECT s.folio, cg.concepto
+       FROM facturas f
+       JOIN solicitudes s ON s.id = f.solicitud_id
+       LEFT JOIN comprobantes_gasto cg ON cg.id = f.concepto_id
+      WHERE f.tipo = 'XML' AND f.uuid = ?
+      LIMIT 1`,
+    [uuid],
+  );
+}
+
+function mensajeDuplicado(uuid: string, previo: R) {
+  const concepto = previo.concepto ? ` (concepto ${previo.concepto})` : "";
+  return `Esta factura (UUID ${uuid}) ya fue cargada en el folio ${previo.folio}${concepto}. Una misma factura no se puede comprobar dos veces. No se guardó el comprobante.`;
 }
 
 const upload = multer({
@@ -101,6 +118,7 @@ comprobacionRouter.post(
     if (!reng) throw notFound("El renglón de comprobación no existe.");
     const sol = await exigirAlcance(auth, String(reng.solicitud_id));
     if (sol.estatus !== "Cerrado") throw new HttpError(409, "Solo se comprueban solicitudes autorizadas.");
+    await exigirNoCompensado(String(reng.solicitud_id));
     if (auth.role.nombre === "gestor_vuelos" && reng.concepto !== "Avión") {
       throw forbidden("Solo puedes comprobar el concepto Avión.");
     }
@@ -122,8 +140,10 @@ comprobacionRouter.post(
       if (dup) throw bad(`El archivo "${nombre}" ya fue cargado para esta solicitud.`);
     }
 
-    const uuid = ("UUID-" + randomUUID().slice(0, 8)).toUpperCase();
-    // Si el XML no trae Total se simula (200–999), como en el prototipo.
+    // UUID fiscal del timbre del SAT (solo comprobantes con XML; los Vales no tienen folio fiscal).
+    let uuid = "";
+    // Monto del comprobante: el Total del XML (obligatorio). Los Vales aún no piden el importe al usuario y
+    // conservan el monto simulado del prototipo (200–999): PENDIENTE de definir cómo capturarlo.
     let total = Math.floor(Math.random() * 800) + 200;
     if (!esVales && xml) {
       const text = xml.buffer.toString("utf8");
@@ -143,11 +163,22 @@ comprobacionRouter.post(
       } else if (rfcMatch && soc && String(rfcMatch[1]).toUpperCase() !== String(soc.rfc).toUpperCase()) {
         throw bad(`El RFC del receptor del XML no coincide con la sociedad (${soc.rfc}). No se guardó el comprobante.`);
       }
+      // Duplicidad: el mismo CFDI (mismo UUID del timbre) no se acepta dos veces en todo el portal, aunque se
+      // renombre el archivo o se suba en otra solicitud. Un XML sin timbre no es una factura válida ante el SAT.
+      const leidoUuid = extraerUuidCfdi(text);
+      if (!leidoUuid) {
+        throw bad("El XML no está timbrado ante el SAT (no trae el folio fiscal UUID). No se guardó el comprobante.");
+      }
+      uuid = leidoUuid;
+      const previo = await xmlYaCargado(uuid);
+      if (previo) throw new HttpError(409, mensajeDuplicado(uuid, previo));
       const v = validarContenidoFactura(text, await cargarListasProhibidas());
       if (!v.ok) throw bad(v.motivo);
       const t = text.match(/\sTotal=["']([0-9][0-9.,]*)["']/i);
       const leido = t ? parseFloat(t[1].replace(/,/g, "")) : NaN;
-      if (leido > 0) total = leido;
+      // Antes se inventaba un monto si faltaba el Total; ahora se rechaza (todo CFDI válido lo trae).
+      if (!(leido > 0)) throw bad("El XML no trae el Total de la factura. No se guardó el comprobante.");
+      total = leido;
     }
 
     // Con almacenamiento externo (Drive/carpeta) los archivos se suben antes de la transacción y la BD solo guarda
@@ -181,13 +212,29 @@ comprobacionRouter.post(
       }
     }
 
+    let excedente = 0;
     try {
     await tx(async (c) => {
       // Se bloquea el renglón para calcular el pendiente sin carreras.
-      const r = await one<R>("SELECT monto_solicitado, monto_comprobado FROM comprobantes_gasto WHERE id = ? FOR UPDATE", [req.params.id], c);
+      // (Si dos personas suben el mismo XML al mismo tiempo, el índice único uq_facturas_uuid_xml rechaza la segunda.)
+      const r = await one<R>("SELECT monto_solicitado, monto_comprobado, validado FROM comprobantes_gasto WHERE id = ? FOR UPDATE", [req.params.id], c);
       const pendiente = Number(r!.monto_solicitado) - Number(r!.monto_comprobado);
-      const aplicado = Math.min(total, pendiente);
-      if (aplicado <= 0) throw new HttpError(409, "Este concepto ya está comprobado por completo.");
+      // Lo que exceda lo solicitado no suma al comprobado (tope = solicitado), pero la factura se guarda completa:
+      // ese excedente se decide al "Compensar viaje" (reembolsar o no). Con el concepto ya cubierto, la factura
+      // entra solo como gasto excedente (aplica 0). Los Vales no admiten excedente (aún no se captura su importe).
+      if (pendiente <= 0 && (esVales || !(Number(r!.monto_solicitado) > 0))) {
+        throw new HttpError(409, "Este concepto ya está comprobado por completo.");
+      }
+      const aplicado = Math.max(0, Math.min(total, pendiente));
+      excedente = esVales ? 0 : Math.round((total - aplicado) * 100) / 100;
+      // Una factura nueva en un concepto ya validado debe volver a revisarla Compras.
+      if (Number(r!.validado)) {
+        await exec(
+          "UPDATE comprobantes_gasto SET validado = 0, validado_por = NULL, validado_fecha = NULL WHERE id = ?",
+          [req.params.id],
+          c,
+        );
+      }
 
       const parId = esVales ? null : newId("par_");
       const insertar = async (f: Express.Multer.File, tipo: string, montoAplicado: number) => {
@@ -212,11 +259,15 @@ comprobacionRouter.post(
     }, auth.user.id);
     } catch (e) {
       await quitarArchivos([...refs.values()]);
+      if (uuid && (e as { code?: string })?.code === "ER_DUP_ENTRY") {
+        const previo = await xmlYaCargado(uuid);
+        if (previo) throw new HttpError(409, mensajeDuplicado(uuid, previo));
+      }
       throw e;
     }
 
     const r = await one<R>("SELECT * FROM comprobantes_gasto WHERE id = ?", [req.params.id]);
-    res.status(201).json({ renglon: comprobanteOut(r!), uuid, total });
+    res.status(201).json({ renglon: comprobanteOut(r!), uuid, total, excedente });
   },
 );
 
@@ -226,6 +277,7 @@ comprobacionRouter.delete("/comprobacion/facturas/:key", requirePerm("comprobar"
   const items = await rows<R>("SELECT id, solicitud_id, ruta FROM facturas WHERE par_id = ? OR id = ?", [req.params.key, req.params.key]);
   if (!items.length) throw notFound("El comprobante no existe.");
   await exigirAlcance(auth, String(items[0].solicitud_id));
+  await exigirNoCompensado(String(items[0].solicitud_id));
   await tx((c) => exec("DELETE FROM facturas WHERE par_id = ? OR id = ?", [req.params.key, req.params.key], c), auth.user.id);
   // Ya sin la fila en BD: los archivos físicos van a la papelera (mejor esfuerzo; un fallo no rompe la baja).
   await quitarArchivos(items.map((i) => i.ruta).filter((r): r is string => typeof r === "string" && r !== ""));
@@ -239,6 +291,7 @@ comprobacionRouter.patch("/comprobacion/renglones/:id/validacion", requirePerm("
   const r = await one<R>("SELECT * FROM comprobantes_gasto WHERE id = ?", [req.params.id]);
   if (!r) throw notFound("El renglón no existe.");
   await exigirAlcance(auth, String(r.solicitud_id));
+  await exigirNoCompensado(String(r.solicitud_id));
 
   const sets: string[] = [];
   const params: unknown[] = [];

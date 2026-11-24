@@ -1,4 +1,5 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import {
   Search,
@@ -12,11 +13,13 @@ import {
   ReceiptText,
   CheckCircle2,
   Lock,
+  AlertTriangle,
+  Scale,
 } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "@/lib/auth";
 import { showErrorDialog } from "@/components/ErrorDialog";
-import { api } from "@/lib/api";
+import { api, ApiError, reportApiError } from "@/lib/api";
 import {
   CONFIG_DEFAULTS,
   lista,
@@ -26,6 +29,7 @@ import {
   useComprobantes,
   useConfig,
   useRevisionesMonto,
+  useCompensaciones,
   useSolicitudDetalle,
   useSolicitudes,
   useUsuarios,
@@ -33,15 +37,24 @@ import {
 } from "@/lib/queries";
 import {
   fmtMoney,
+  fmtTarifa,
   avanceComprobacion,
   avanceValidacion,
   bloqueoMontoHotel,
   estatusVisible,
+  pasoAutorizacion,
+  requiereAccion,
   ESTATUS_VISIBLES,
   type Solicitud,
   type Hotel,
 } from "@/lib/store";
+import { Paginacion, usePaginacion } from "@/components/portal/Paginacion";
+import { CompensarViajeDialog, ResumenCompensado } from "@/components/portal/CompensarViajeDialog";
 import { StatusBadge } from "./_portal.dashboard";
+
+// Opción por omisión del filtro de Estatus (ver requiereAccion en store.ts).
+const FILTRO_ACCION = "Requieren mi acción";
+const FILTRO_COMPENSADO = "Compensado";
 import { Modal } from "./_portal.solicitar";
 
 export const Route = createFileRoute("/_portal/estatus")({
@@ -80,6 +93,7 @@ function resolveHotelName(h: HotelStayStored, estado: string, catalogo: Hotel[])
 function Estatus() {
   const { user, role, hasPerm } = useAuth();
   const nav = useNavigate();
+  const qc = useQueryClient();
   const { atrasados: soloAtrasados } = Route.useSearch();
   const { data: solicitudesData } = useSolicitudes(true);
   const solicitudes = lista(solicitudesData);
@@ -93,17 +107,25 @@ function Estatus() {
   const hotelesCatalogo: Hotel[] = lista(catalogos?.hoteles);
   const { data: revisionesData } = useRevisionesMonto();
   const revisionesMonto = lista(revisionesData);
+  const { data: compensacionesData } = useCompensaciones();
+  const compensaciones = lista(compensacionesData);
+  const [compensando, setCompensando] = useState<Solicitud | null>(null);
   const { data: configData } = useConfig();
   const config = configData ?? CONFIG_DEFAULTS;
   const umbral = config.umbral_finanzas ?? 5000;
   const diasComprobacionAtrasada = config.dias_comprobacion_atrasada ?? 7;
 
   const [q, setQ] = useState("");
-  const [estado, setEstado] = useState("Todos");
+  // Por omisión solo lo que requiere acción del usuario; el enlace de "atrasadas" del Dashboard muestra
+  // todos para que la lista coincida con el número del aviso.
+  const [estado, setEstado] = useState(soloAtrasados ? "Todos" : FILTRO_ACCION);
   const [usuarioFiltro, setUsuarioFiltro] = useState("Todos");
   const [detail, setDetail] = useState<Solicitud | null>(null);
   const [rejecting, setRejecting] = useState<Solicitud | null>(null);
   const [rejectNote, setRejectNote] = useState("");
+  // Aviso obligatorio antes de autorizar un folio con hotel de monto manual.
+  const [confirmarManual, setConfirmarManual] = useState<Solicitud | null>(null);
+  const [aceptoManual, setAceptoManual] = useState(false);
   const { data: detalle } = useSolicitudDetalle(detail?.id);
 
   // Mismo criterio que usa "Comprobación": comprobado solo cuando el total
@@ -127,6 +149,25 @@ function Estatus() {
       </span>
     ) : null;
   };
+  // Viaje compensado (cerrado por Finanzas/Compras).
+  const compensacionDe = (solicitudId: string) => compensaciones.find((c) => c.solicitud_id === solicitudId);
+  const marcaCompensado = (s: Solicitud) =>
+    compensacionDe(s.id) ? (
+      <span
+        className="ckl-badge ml-1 align-middle"
+        style={{ background: "#EEF2FF", color: "#3730A3" }}
+        title="Viaje compensado"
+      >
+        <Scale size={11} /> Compensado
+      </span>
+    ) : null;
+  // Botón "Compensar viaje": permiso compensar_viaje, folio comprobado al 100 %, validado y aún sin compensar.
+  const puedeCompensar = (s: Solicitud) =>
+    hasPerm("compensar_viaje") &&
+    s.estatus === "Cerrado" &&
+    estaComprobado(s.id) &&
+    estaValidado(s.id) &&
+    !compensacionDe(s.id);
   const marcaValidado = (s: Solicitud) =>
     s.estatus === "Cerrado" && estaValidado(s.id) ? (
       <span
@@ -141,7 +182,8 @@ function Estatus() {
   // el resto de los casos abre el detalle de siempre.
   const esValidador = hasPerm("validar_comprobacion") && !hasPerm("comprobar");
   const abrirFolio = (s: Solicitud) => {
-    if (esValidador && s.estatus === "Cerrado" && estaComprobado(s.id)) {
+    // Ya validado: abre el detalle (ahí está "Compensar viaje" o el resumen de la compensación).
+    if (esValidador && s.estatus === "Cerrado" && estaComprobado(s.id) && !estaValidado(s.id)) {
       nav({ to: "/comprobacion", search: { solicitudId: s.id } });
       return;
     }
@@ -168,11 +210,26 @@ function Estatus() {
 
   const filtered = useMemo(() => {
     const comprobado = (id: string) => avanceComprobacion(comprobantesGasto, id).completo;
+    const validado = (id: string) => avanceValidacion(comprobantesGasto, id).completa;
+    const compensados = new Set(compensaciones.map((c) => c.solicitud_id));
     return visibles.filter((s) => {
       const u = users.find((x) => x.id === s.user_id);
       const matchQ = !q || s.folio.toLowerCase().includes(q.toLowerCase()) || (u?.nombre.toLowerCase().includes(q.toLowerCase()) ?? false);
       const matchE =
-        estado === "Todos" || estatusVisible(s.estatus, comprobado(s.id)) === estado;
+        estado === "Todos" ||
+        (estado === FILTRO_ACCION
+          ? requiereAccion(s, {
+              userId: user?.id,
+              permisos: role?.permisos,
+              umbral,
+              comprobado: comprobado(s.id),
+              validado: validado(s.id),
+              compensado: compensados.has(s.id),
+            })
+          : estado === FILTRO_COMPENSADO
+            ? compensados.has(s.id)
+            : // Los compensados no se mezclan con "Comprobado" (tienen su propia opción).
+              !compensados.has(s.id) && estatusVisible(s.estatus, comprobado(s.id)) === estado);
       const diasTranscurridos = (Date.now() - new Date(s.created_at).getTime()) / 86400000;
       const matchU = usuarioFiltro === "Todos" || s.user_id === usuarioFiltro;
       const matchAtrasados =
@@ -191,7 +248,12 @@ function Estatus() {
     soloAtrasados,
     comprobantesGasto,
     diasComprobacionAtrasada,
+    compensaciones,
+    user?.id,
+    role?.permisos,
+    umbral,
   ]);
+  const { visibles: paginaFolios, paginacion } = usePaginacion(filtered);
 
   // Desglose detallado (hoteles, transportes, otros conceptos) del folio abierto
   // en el modal, para que quien autoriza vea qué compone el monto total.
@@ -205,30 +267,51 @@ function Estatus() {
 
   const canEdit = (s: Solicitud) => s.user_id === user?.id && s.estatus === "Abierto" && !autorizaciones.find((a) => a.solicitud_id === s.id);
 
-  const canAuth = (s: Solicitud) => {
-    if (!role) return false;
-    if (s.estatus !== "Abierto") return false;
-    // Nadie autoriza ni rechaza su propia solicitud (p. ej. un jefe que ve sus folios).
-    if (s.user_id === user?.id) return false;
-    // El paso de Jefe siempre lo puede dar quien tenga el permiso, sin importar el
-    // monto: el umbral solo decide si además se necesita un segundo visto bueno de
-    // Finanzas, no si el propio Jefe puede autorizar. Antes exigir monto ≤ umbral
-    // aquí dejaba las solicitudes de monto alto sin nadie que pudiera autorizarlas.
-    if (role.permisos.autorizar_lte5000 && s.jefe_status === "Pendiente") return "jefe";
-    if (role.permisos.autorizar_gt5000 && s.monto_total > umbral && s.jefe_status === "Autorizado" && s.finanzas_status === "Pendiente") return "finanzas";
-    return false;
-  };
+  // Nadie autoriza ni rechaza su propia solicitud; el paso de Jefe no depende del monto (ver pasoAutorizacion).
+  const canAuth = (s: Solicitud) => pasoAutorizacion(s, user?.id, role?.permisos, umbral);
 
-  // El servidor aplica las reglas (quién autoriza, umbral, bloqueo por monto manual, cierre).
-  const autorizarMut = useApiMutation((s: Solicitud) => api.post(`/solicitudes/${s.id}/autorizar`), {
-    onSuccess: (_r, s) => {
-      toast.success(`Solicitud ${s.folio} autorizada.`);
-      setDetail(null);
+  // Hoteles del folio con monto modificado manualmente (cada uno abrió una revisión de Compras).
+  const hotelesManuales = (s: Solicitud) =>
+    revisionesMonto.filter((r) => r.solicitud_id === s.id && r.vigente !== false);
+
+  // El servidor aplica las reglas (quién autoriza, umbral, bloqueo por monto manual, cierre) y exige
+  // confirmar el aviso de hotel manual (`confirmo_hotel_manual`), así que el aviso no se puede omitir.
+  const autorizarMut = useApiMutation(
+    (v: { s: Solicitud; confirmo: boolean }) =>
+      api.post(`/solicitudes/${v.s.id}/autorizar`, { confirmo_hotel_manual: v.confirmo }),
+    {
+      silencioso: true,
+      onSuccess: (_r, v) => {
+        toast.success(`Solicitud ${v.s.folio} autorizada.`);
+        setConfirmarManual(null);
+        setDetail(null);
+      },
     },
-  });
+  );
+  const enviarAutorizacion = (s: Solicitud, confirmo: boolean) =>
+    autorizarMut.mutate(
+      { s, confirmo },
+      {
+        onError: (e) => {
+          // Si la lista local no traía el monto manual (p. ej. se editó hace un momento), se muestra el aviso.
+          if (e instanceof ApiError && e.code === "HOTEL_MANUAL_SIN_CONFIRMAR") {
+            void qc.invalidateQueries({ queryKey: ["revisiones"] });
+            setAceptoManual(false);
+            setConfirmarManual(s);
+            return;
+          }
+          reportApiError(e);
+        },
+      },
+    );
   const authorize = (s: Solicitud) => {
     if (!canAuth(s)) return;
-    autorizarMut.mutate(s);
+    if (hotelesManuales(s).length) {
+      setAceptoManual(false);
+      setConfirmarManual(s);
+      return;
+    }
+    enviarAutorizacion(s, false);
   };
 
   const rechazarMut = useApiMutation(
@@ -331,16 +414,24 @@ function Estatus() {
         <div>
           <label className="ckl-label">Estatus</label>
           <select className="ckl-input" value={estado} onChange={(e) => setEstado(e.target.value)}>
-            {["Todos", ...ESTATUS_VISIBLES].map((s) => <option key={s}>{s}</option>)}
+            {[FILTRO_ACCION, "Todos", ...ESTATUS_VISIBLES, FILTRO_COMPENSADO].map((s) => (
+              <option key={s}>{s}</option>
+            ))}
           </select>
         </div>
       </div>
+      {estado === FILTRO_ACCION && (
+        <p className="-mt-2 px-1 text-xs text-muted-foreground">
+          Mostrando solo los folios que requieren tu acción. Elige “Todos” en Estatus para ver también
+          los comprobados, rechazados y ya validados.
+        </p>
+      )}
 
       <div className="ckl-card overflow-hidden">
         {/* Móvil (< 768 px): tarjetas apiladas. Un toque (o el ojo) abre el detalle;
             así no depende del doble toque, que en móvil dispara el zoom del navegador. */}
         <ul className="divide-y md:hidden">
-          {filtered.map((s) => {
+          {paginaFolios.map((s) => {
             const ok = s.jefe_status === "Autorizado" && (s.finanzas_status === "Autorizado" || s.finanzas_status === "N/A");
             const bad = s.estatus === "Rechazado";
             const stripe = bad ? "#E30613" : ok ? "#2D6A4F" : "#CCC";
@@ -357,6 +448,7 @@ function Estatus() {
                       <span className="inline-flex items-center">
                         <StatusBadge estatus={s.estatus} comprobado={estaComprobado(s.id)} />
                         {marcaValidado(s)}
+                        {marcaCompensado(s)}
                         {marcaBloqueo(s)}
                       </span>
                     </div>
@@ -420,7 +512,7 @@ function Estatus() {
               </tr>
             </thead>
             <tbody>
-              {filtered.map((s) => {
+              {paginaFolios.map((s) => {
                 const ok = s.jefe_status === "Autorizado" && (s.finanzas_status === "Autorizado" || s.finanzas_status === "N/A");
                 const bad = s.estatus === "Rechazado";
                 const stripe = bad ? "#E30613" : ok ? "#2D6A4F" : "#CCC";
@@ -439,7 +531,7 @@ function Estatus() {
                         : <span className="ckl-badge" style={{ background: "#FEE2E2", color: "#DC2626" }}>Sin cargar</span>}
                     </td>
                     <td className="p-3">{s.nota_rechazo && <MessageSquareWarning size={16} className="text-[color:var(--color-primary)]" />}</td>
-                    <td className="p-3 whitespace-nowrap"><StatusBadge estatus={s.estatus} comprobado={estaComprobado(s.id)} />{marcaValidado(s)}{marcaBloqueo(s)}</td>
+                    <td className="p-3 whitespace-nowrap"><StatusBadge estatus={s.estatus} comprobado={estaComprobado(s.id)} />{marcaValidado(s)}{marcaCompensado(s)}{marcaBloqueo(s)}</td>
                   </tr>
                 );
               })}
@@ -449,6 +541,7 @@ function Estatus() {
             </tbody>
           </table>
         </div>
+        <Paginacion {...paginacion} className="border-t px-3" />
         <div className="border-t bg-secondary p-2 text-[11px] text-muted-foreground">
           <span className="hidden md:inline">
             {esValidador
@@ -644,6 +737,28 @@ function Estatus() {
             </div>
           )}
 
+          {canAuth(detail) && !bloqueoDe(detail) && hotelesManuales(detail).length > 0 && (
+            <div
+              className="mt-4 flex items-start gap-2 rounded-md border p-3 text-xs"
+              style={{ background: "#FEF3C7", color: "#92400E", borderColor: "#F59E0B" }}
+            >
+              <AlertTriangle size={16} className="mt-0.5 shrink-0" />
+              <span>
+                <b>Atención:</b> este folio tiene {hotelesManuales(detail).length} hotel(es) con monto
+                modificado manualmente. Antes de autorizar se te pedirá confirmarlo.
+              </span>
+            </div>
+          )}
+
+          {compensacionDe(detail.id) && (
+            <div className="mt-4">
+              <ResumenCompensado
+                c={compensacionDe(detail.id)!}
+                quien={userName(compensacionDe(detail.id)!.compensado_por)}
+              />
+            </div>
+          )}
+
           <div className="mt-5 flex flex-wrap justify-end gap-2">
             {canEdit(detail) && (
               <>
@@ -688,13 +803,31 @@ function Estatus() {
                 </button>
               </>
             )}
-            {hasPerm("configurar_permisos") && autorizaciones.some((a) => a.solicitud_id === detail.id) && (
+            {puedeCompensar(detail) && (
+              <button onClick={() => setCompensando(detail)} className="ckl-btn-primary">
+                <Scale size={14} /> Compensar viaje
+              </button>
+            )}
+            {hasPerm("configurar_permisos") &&
+              !compensacionDe(detail.id) &&
+              autorizaciones.some((a) => a.solicitud_id === detail.id) && (
               <button onClick={() => revertir(detail)} className="ckl-btn-outline">
                 <RotateCcw size={14} /> Revertir autorización
               </button>
             )}
           </div>
         </Modal>
+      )}
+
+      {compensando && (
+        <CompensarViajeDialog
+          solicitud={compensando}
+          onClose={() => setCompensando(null)}
+          onListo={() => {
+            setCompensando(null);
+            setDetail(null);
+          }}
+        />
       )}
 
       {rejecting && (
@@ -704,6 +837,89 @@ function Estatus() {
           <div className="mt-4 flex justify-end gap-2">
             <button onClick={() => setRejecting(null)} className="ckl-btn-ghost">Cancelar</button>
             <button onClick={reject} className="ckl-btn-primary">Confirmar rechazo</button>
+          </div>
+        </Modal>
+      )}
+
+      {confirmarManual && (
+        <Modal onClose={() => setConfirmarManual(null)}>
+          <div className="flex items-center gap-2" style={{ color: "#B45309" }}>
+            <AlertTriangle size={22} className="shrink-0" />
+            <h3 className="text-lg font-semibold">Hotel con monto modificado manualmente</h3>
+          </div>
+          <p className="mt-2 text-sm">
+            Vas a autorizar el folio <b>{confirmarManual.folio}</b>, que incluye hospedaje con una
+            tarifa distinta a la del convenio. Revisa el detalle antes de continuar:
+          </p>
+          <ul className="mt-3 space-y-2">
+            {hotelesManuales(confirmarManual).map((r) => {
+              const diferencia = r.monto_manual - r.tarifa_default;
+              const signo = diferencia > 0 ? "+" : diferencia < 0 ? "−" : "";
+              return (
+                <li
+                  key={r.id}
+                  className="rounded-md border p-3 text-xs"
+                  style={{ background: "#FFFBEB", borderColor: "#F59E0B" }}
+                >
+                  <div className="font-semibold">
+                    {r.hotel_nombre} · {r.destino_estado}
+                    {r.tipo_habitacion === "doble" ? " · Habitación doble" : ""}
+                  </div>
+                  <div className="mt-1 text-muted-foreground">
+                    {r.fecha_inicio} → {r.fecha_fin} · {r.noches} noche(s)
+                  </div>
+                  <div className="mt-1">
+                    Tarifa del convenio:{" "}
+                    <b>{r.tarifa_default > 0 ? `${fmtTarifa(r.tarifa_default)} por noche` : "sin convenio"}</b>
+                    {" · "}Capturada: <b>{fmtTarifa(r.monto_manual)} por noche</b>
+                  </div>
+                  {r.tarifa_default > 0 && (
+                    <div className="mt-1" style={{ color: diferencia > 0 ? "#B5040F" : "#2D6A4F" }}>
+                      Diferencia: {signo}
+                      {fmtTarifa(Math.abs(diferencia))} por noche ({signo}
+                      {fmtMoney(Math.abs(diferencia) * r.noches)} en la estancia)
+                    </div>
+                  )}
+                  {r.motivo && (
+                    <div className="mt-1">
+                      Motivo del solicitante: <i>{r.motivo}</i>
+                    </div>
+                  )}
+                  <div className="mt-1">
+                    Revisión de Compras:{" "}
+                    <b>
+                      {r.estado === "pendiente"
+                        ? "pendiente"
+                        : r.estado === "aceptado"
+                          ? "aceptada"
+                          : "rechazada"}
+                    </b>
+                    {r.comentario ? ` — “${r.comentario}”` : ""}
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+          <label className="mt-4 flex items-start gap-2 text-sm">
+            <input
+              type="checkbox"
+              className="mt-1"
+              checked={aceptoManual}
+              onChange={(e) => setAceptoManual(e.target.checked)}
+            />
+            <span>Revisé el monto manual del hotel y autorizo la solicitud con este cambio.</span>
+          </label>
+          <div className="mt-4 flex justify-end gap-2">
+            <button onClick={() => setConfirmarManual(null)} className="ckl-btn-ghost">
+              Cancelar
+            </button>
+            <button
+              onClick={() => enviarAutorizacion(confirmarManual, true)}
+              disabled={!aceptoManual || autorizarMut.isPending}
+              className="ckl-btn-primary"
+            >
+              <Check size={14} /> Autorizar con hotel manual
+            </button>
           </div>
         </Modal>
       )}

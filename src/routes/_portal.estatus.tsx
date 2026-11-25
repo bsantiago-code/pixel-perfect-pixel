@@ -15,6 +15,7 @@ import {
   Lock,
   AlertTriangle,
   Scale,
+  PiggyBank,
 } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "@/lib/auth";
@@ -42,6 +43,8 @@ import {
   avanceValidacion,
   bloqueoMontoHotel,
   estatusVisible,
+  evaluarPresupuestoFolio,
+  fmtFechaIso,
   pasoAutorizacion,
   requiereAccion,
   ESTATUS_VISIBLES,
@@ -141,6 +144,12 @@ function Estatus() {
   // Folio bloqueado para autorizar por monto manual de hotel (si el parámetro está activo).
   const bloqueoDe = (s: Solicitud) =>
     s.estatus === "Abierto" ? bloqueoMontoHotel(s.id, revisionesMonto, config) : null;
+  // Presupuesto del departamento del folio abierto en el detalle (solo llega a quien autoriza o administra
+  // presupuestos). Con el parámetro de bloqueo activo, un folio que excede no se puede autorizar.
+  const infoPresupuesto = detail && detalle?.solicitud.id === detail.id ? detalle.presupuesto : undefined;
+  const evalPresupuesto = detail ? evaluarPresupuestoFolio(infoPresupuesto, detail, config) : null;
+  const bloqueoAutorizar = (s: Solicitud) =>
+    bloqueoDe(s) ?? (detail?.id === s.id ? (evalPresupuesto?.bloqueo ?? null) : null);
   const marcaBloqueo = (s: Solicitud) => {
     const motivo = bloqueoDe(s);
     return motivo ? (
@@ -727,6 +736,44 @@ function Estatus() {
             </div>
           )}
 
+          {evalPresupuesto && detail.estatus !== "Rechazado" && (
+            <div
+              className="mt-4 rounded-md border p-3 text-xs"
+              style={
+                evalPresupuesto.excede
+                  ? { background: "#FEF3C7", color: "#92400E", borderColor: "#F59E0B" }
+                  : { background: "#F8FAFC", color: "#334155" }
+              }
+            >
+              <div className="flex items-center gap-1.5 font-semibold">
+                <PiggyBank size={14} /> Presupuesto del departamento
+                {infoPresupuesto?.departamento ? ` · ${infoPresupuesto.departamento}` : ""}
+              </div>
+              {infoPresupuesto?.presupuesto && (
+                <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-4">
+                  {[
+                    [
+                      "Periodo",
+                      `${fmtFechaIso(infoPresupuesto.presupuesto.fecha_inicio)} – ${fmtFechaIso(infoPresupuesto.presupuesto.fecha_fin)}`,
+                    ],
+                    ["Asignado", fmtMoney(infoPresupuesto.presupuesto.monto)],
+                    ["Ejercido", fmtMoney(infoPresupuesto.presupuesto.ejercido)],
+                    ["Disponible", fmtMoney(infoPresupuesto.presupuesto.disponible)],
+                  ].map(([k, v]) => (
+                    <div key={k}>
+                      <div className="opacity-75">{k}</div>
+                      <div className="font-medium">{v}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div className="mt-2 flex items-start gap-1.5">
+                {evalPresupuesto.excede && <AlertTriangle size={14} className="mt-0.5 shrink-0" />}
+                <span>{evalPresupuesto.bloqueo ?? evalPresupuesto.mensaje}</span>
+              </div>
+            </div>
+          )}
+
           {bloqueoDe(detail) && (
             <div
               className="mt-4 flex items-start gap-2 rounded-md p-3 text-xs"
@@ -795,8 +842,8 @@ function Estatus() {
                 <button onClick={() => setRejecting(detail)} className="ckl-btn-outline"><X size={14} /> Rechazar</button>
                 <button
                   onClick={() => authorize(detail)}
-                  disabled={!!bloqueoDe(detail)}
-                  title={bloqueoDe(detail) ?? undefined}
+                  disabled={!!bloqueoAutorizar(detail)}
+                  title={bloqueoAutorizar(detail) ?? undefined}
                   className="ckl-btn-primary"
                 >
                   <Check size={14} /> Autorizar

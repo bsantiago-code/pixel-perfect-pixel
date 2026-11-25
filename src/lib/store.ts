@@ -21,6 +21,8 @@ export type User = {
   jefe_id: string | null;
   activo: boolean;
   initials: string;
+  // Departamento cuyo presupuesto descuentan sus viajes (null = sin asignar).
+  departamento_id?: number | null;
 };
 
 export type Sociedad = {
@@ -416,6 +418,118 @@ export function bloqueoMontoHotel(
 }
 
 // Usuarios activos cuyo rol puede revisar montos manuales (Compras Corporativas y Compras Corp).
+
+// ───────── Presupuestos por departamento (Admin / Finanzas) ─────────
+// Bolsas por departamento y rango de fechas (por omisión un mes). Lo ejercido lo calcula MySQL
+// (v_presupuestos) con los folios autorizados cuya fecha de solicitud cae en el rango; aquí solo
+// hay tipos y cálculos de presentación.
+export type Departamento = { id: number; nombre: string; activo: boolean };
+
+export type Presupuesto = {
+  id: string;
+  departamento_id: number;
+  departamento: string;
+  fecha_inicio: string; // yyyy-mm-dd
+  fecha_fin: string; // yyyy-mm-dd
+  monto: number;
+  notas: string;
+  ejercido: number; // folios autorizados
+  disponible: number; // monto − ejercido (puede ser negativo si se autorizó de más)
+  folios_autorizados: number;
+  por_autorizar: number; // folios aún pendientes (no descuentan)
+  folios_por_autorizar: number;
+  comprobado: number;
+};
+
+/** Presupuesto que le toca a un folio (detalle en Estatus, solo para quien autoriza). */
+export type PresupuestoFolio = {
+  departamento_id: number | null;
+  departamento: string | null;
+  presupuesto: Presupuesto | null;
+};
+
+/** 'yyyy-mm-dd' → 'dd/mm/yyyy'. */
+export function fmtFechaIso(iso: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso);
+  return m ? `${m[3]}/${m[2]}/${m[1]}` : iso;
+}
+
+const isoDe = (d: Date) => `${d.getFullYear()}-${dos(d.getMonth() + 1)}-${dos(d.getDate())}`;
+const fechaDe = (iso: string) => {
+  const [y, m, d] = iso.split("-").map(Number);
+  return new Date(y, m - 1, d);
+};
+
+/** Primer y último día del mes de `hoy` (periodo por omisión de una bolsa nueva). */
+export function mesDe(hoy: string = hoyLocal()): { fecha_inicio: string; fecha_fin: string } {
+  const d = fechaDe(hoy);
+  return {
+    fecha_inicio: isoDe(new Date(d.getFullYear(), d.getMonth(), 1)),
+    fecha_fin: isoDe(new Date(d.getFullYear(), d.getMonth() + 1, 0)),
+  };
+}
+
+/**
+ * Periodo que sigue a una bolsa (botón "Renovar"): empieza al día siguiente de su fin. Si la bolsa era un mes
+ * calendario completo, la nueva es el mes siguiente completo; si no, dura los mismos días.
+ */
+export function periodoSiguiente(p: { fecha_inicio: string; fecha_fin: string }) {
+  const ini = fechaDe(p.fecha_inicio);
+  const fin = fechaDe(p.fecha_fin);
+  const nuevoIni = new Date(fin.getFullYear(), fin.getMonth(), fin.getDate() + 1);
+  const mesCompleto =
+    ini.getDate() === 1 &&
+    ini.getMonth() === fin.getMonth() &&
+    ini.getFullYear() === fin.getFullYear() &&
+    new Date(fin.getFullYear(), fin.getMonth(), fin.getDate() + 1).getDate() === 1;
+  if (mesCompleto) return mesDe(isoDe(nuevoIni));
+  const dias = Math.round((fin.getTime() - ini.getTime()) / 86400000);
+  return {
+    fecha_inicio: isoDe(nuevoIni),
+    fecha_fin: isoDe(new Date(nuevoIni.getFullYear(), nuevoIni.getMonth(), nuevoIni.getDate() + dias)),
+  };
+}
+
+/** % ejercido de una bolsa (0 si el monto es 0 y no hay gasto; 100+ si se rebasó). */
+export function pctEjercido(p: Pick<Presupuesto, "monto" | "ejercido">): number {
+  if (p.monto <= 0) return p.ejercido > 0 ? 100 : 0;
+  return Math.round((p.ejercido / p.monto) * 100);
+}
+
+/**
+ * Cómo queda el presupuesto si se autoriza el folio. Mismo criterio que sp_autorizar_solicitud: un folio
+ * Abierto aún no está contado en lo ejercido; si no hay bolsa o el disponible no alcanza, "excede". Con el
+ * parámetro `bloquear_autorizacion_sin_presupuesto` activo eso bloquea la autorización (el servidor lo exige).
+ */
+export function evaluarPresupuestoFolio(
+  info: PresupuestoFolio | undefined | null,
+  folio: Pick<Solicitud, "monto_total" | "estatus" | "fecha">,
+  config: { bloquear_autorizacion_sin_presupuesto?: boolean },
+): { excede: boolean; mensaje: string; bloqueo: string | null } | null {
+  if (!info) return null;
+  if (info.departamento_id == null) {
+    return {
+      excede: false,
+      mensaje: "El solicitante no tiene departamento asignado: este folio no descuenta de ningún presupuesto.",
+      bloqueo: null,
+    };
+  }
+  const p = info.presupuesto;
+  const bloquea = folio.estatus === "Abierto" && !!config.bloquear_autorizacion_sin_presupuesto;
+  if (!p) {
+    const mensaje = `El departamento ${info.departamento} no tiene presupuesto para el ${folio.fecha}.`;
+    return { excede: true, mensaje, bloqueo: bloquea ? `Bloqueado: ${mensaje}` : null };
+  }
+  // Si el folio ya está autorizado, su monto ya está dentro de lo ejercido.
+  const restante = folio.estatus === "Abierto" ? p.disponible - folio.monto_total : p.disponible;
+  const excede = folio.estatus === "Abierto" && restante < 0;
+  const mensaje = excede
+    ? `Este folio (${fmtMoney(folio.monto_total)}) excede el disponible de ${info.departamento} (${fmtMoney(p.disponible)}) por ${fmtMoney(-restante)}.`
+    : folio.estatus === "Abierto"
+      ? `Si se autoriza, a ${info.departamento} le quedan ${fmtMoney(restante)} disponibles.`
+      : `Disponible de ${info.departamento}: ${fmtMoney(restante)}.`;
+  return { excede, mensaje, bloqueo: excede && bloquea ? `Bloqueado: ${mensaje}` : null };
+}
 
 // ───────── Convenios con hoteles (Compras Corporativas) ─────────
 // Altas, bajas y modificaciones de los convenios con hoteles. La "baja" es lógica

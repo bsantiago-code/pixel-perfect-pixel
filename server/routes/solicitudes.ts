@@ -8,6 +8,7 @@ import { autorizacionOut, comprobanteOut, destinosDe, solicitudOut } from "../ma
 import { scopeSolicitudes } from "../scope.ts";
 import { bloqueoNuevaSolicitud, exigirAlcance, guardarSolicitud } from "../services/solicitudes.ts";
 import { exigirNoCompensado } from "./compensaciones.ts";
+import { presupuestoDeSolicitud } from "./presupuestos.ts";
 
 export const solicitudesRouter = Router();
 solicitudesRouter.use(requireAuth);
@@ -62,11 +63,20 @@ solicitudesRouter.get("/solicitudes/bloqueo", async (req, res) => {
 solicitudesRouter.get("/solicitudes/:id", async (req, res) => {
   const auth = me(req);
   const s = await exigirAlcance(auth, String(req.params.id));
-  const [destinos, aut] = await Promise.all([
+  // El presupuesto del departamento solo lo ven quienes autorizan o administran presupuestos.
+  const p = auth.role.permisos;
+  const vePresupuesto = !!(p.autorizar_lte5000 || p.autorizar_gt5000 || p.gestionar_presupuestos);
+  const [destinos, aut, presupuesto] = await Promise.all([
     destinosDe([req.params.id]),
     rows<R>("SELECT * FROM autorizaciones WHERE solicitud_id = ? ORDER BY fecha, FIELD(rol_autorizador, 'jefe_inmediato', 'finanzas')", [s.folio]),
+    vePresupuesto ? presupuestoDeSolicitud(String(req.params.id)) : Promise.resolve(undefined),
   ]);
-  res.json({ solicitud: solicitudOut(s), destinos, autorizaciones: aut.map(autorizacionOut) });
+  res.json({
+    solicitud: solicitudOut(s),
+    destinos,
+    autorizaciones: aut.map(autorizacionOut),
+    ...(presupuesto !== undefined ? { presupuesto } : {}),
+  });
 });
 
 // ───────── alta / edición / baja ─────────

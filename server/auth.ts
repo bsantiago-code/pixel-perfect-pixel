@@ -20,6 +20,7 @@ export type AuthUser = {
   jefe_id: string | null;
   activo: boolean;
   initials: string;
+  departamento_id: number | null;
 };
 export type AuthRole = { id: number; nombre: string; permisos: Record<string, boolean> };
 export type Auth = { user: AuthUser; role: AuthRole };
@@ -52,7 +53,7 @@ export async function verifyPassword(stored: string, plain: string): Promise<boo
 }
 
 // ───────── usuarios / roles ─────────
-const USER_COLS = "id, nombre, correo, rfc, rol_id, empresa, jefe_id, activo, initials";
+const USER_COLS = "id, nombre, correo, rfc, rol_id, empresa, jefe_id, activo, initials, departamento_id";
 
 export function toAuthUser(r: Record<string, unknown>): AuthUser {
   return {
@@ -65,6 +66,7 @@ export function toAuthUser(r: Record<string, unknown>): AuthUser {
     jefe_id: (r.jefe_id as string | null) ?? null,
     activo: !!r.activo,
     initials: String(r.initials ?? ""),
+    departamento_id: r.departamento_id == null ? null : Number(r.departamento_id),
   };
 }
 

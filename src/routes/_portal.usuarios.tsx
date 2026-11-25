@@ -4,10 +4,10 @@ import { Edit2, Plus, UserCog } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "@/lib/auth";
 import { api } from "@/lib/api";
-import { lista, useApiMutation, useRoles, useUsuarios } from "@/lib/queries";
+import { lista, useApiMutation, useDepartamentos, useRoles, useUsuarios } from "@/lib/queries";
 import { showErrorDialog } from "@/components/ErrorDialog";
 import { Paginacion, usePaginacion } from "@/components/portal/Paginacion";
-import type { Role, User } from "@/lib/store";
+import type { Departamento, Role, User } from "@/lib/store";
 import { Modal } from "./_portal.solicitar";
 
 export const Route = createFileRoute("/_portal/usuarios")({
@@ -30,8 +30,10 @@ function Usuarios() {
   const { role: myRole, hasPerm } = useAuth();
   const { data: usersData } = useUsuarios();
   const { data: rolesData } = useRoles();
+  const { data: deptosData } = useDepartamentos();
   const users = lista(usersData);
   const roles = lista(rolesData);
+  const departamentos = lista(deptosData);
   const [edit, setEdit] = useState<User | null>(null);
   const [creating, setCreating] = useState(false);
   const { visibles: paginaUsuarios, paginacion } = usePaginacion(users);
@@ -58,6 +60,7 @@ function Usuarios() {
 
   const roleName = (id: number) => roles.find((r) => r.id === id)?.nombre ?? "—";
   const jefe = (id: string | null) => users.find((u) => u.id === id)?.nombre ?? "—";
+  const depto = (id: number | null | undefined) => departamentos.find((d) => d.id === id)?.nombre ?? "—";
 
   const soyAdmin = myRole?.nombre === "administrador";
   const canModify = (u: User) => soyAdmin || roleName(u.rol_id) !== "administrador";
@@ -92,7 +95,7 @@ function Usuarios() {
   return (
     <div className="space-y-4">
       <div className="flex justify-end">
-        <button onClick={() => { setCreating(true); setEdit({ id: "", nombre: "", correo: "", password: "", rfc: "", rol_id: 1, empresa: "WATA GROUP", jefe_id: null, activo: true, initials: "" }); }} className="ckl-btn-primary">
+        <button onClick={() => { setCreating(true); setEdit({ id: "", nombre: "", correo: "", password: "", rfc: "", rol_id: 1, empresa: "WATA GROUP", jefe_id: null, activo: true, initials: "", departamento_id: null }); }} className="ckl-btn-primary">
           <Plus size={14} /> Nuevo usuario
         </button>
       </div>
@@ -114,6 +117,7 @@ function Usuarios() {
                   <div className="mt-0.5 break-all text-xs text-muted-foreground">{u.correo}</div>
                   <div className="mt-0.5 text-xs text-muted-foreground">{u.empresa}</div>
                   <div className="text-xs text-muted-foreground">Jefe: {jefe(u.jefe_id)}</div>
+                  <div className="text-xs text-muted-foreground">Departamento: {depto(u.departamento_id)}</div>
                 </div>
                 <div className="flex shrink-0 flex-col items-end gap-2">
                   <button
@@ -141,7 +145,7 @@ function Usuarios() {
         <div className="hidden overflow-x-auto md:block">
           <table className="w-full text-sm">
             <thead className="bg-secondary text-left text-xs text-muted-foreground">
-              <tr><th className="p-3">Nombre</th><th className="p-3">Correo</th><th className="p-3">Rol</th><th className="p-3">Empresa</th><th className="p-3">Jefe</th><th className="p-3">Activo</th><th className="p-3"></th></tr>
+              <tr><th className="p-3">Nombre</th><th className="p-3">Correo</th><th className="p-3">Rol</th><th className="p-3">Empresa</th><th className="p-3">Jefe</th><th className="p-3">Departamento</th><th className="p-3">Activo</th><th className="p-3"></th></tr>
             </thead>
             <tbody>
               {paginaUsuarios.map((u) => {
@@ -159,6 +163,7 @@ function Usuarios() {
                     <td className="p-3"><span className="ckl-badge" style={{ background: rc.bg, color: rc.fg }}>{roleName(u.rol_id)}</span></td>
                     <td className="p-3 text-xs">{u.empresa}</td>
                     <td className="p-3 text-xs">{jefe(u.jefe_id)}</td>
+                    <td className="p-3 text-xs">{depto(u.departamento_id)}</td>
                     <td className="p-3">
                       <button
                         onClick={() => toggleActive(u)}
@@ -189,12 +194,12 @@ function Usuarios() {
         <Paginacion {...paginacion} className="border-t px-3" />
       </div>
 
-      {edit && <UserModal user={edit} roles={roles} users={users} onClose={() => { setEdit(null); setCreating(false); }} onSave={save} />}
+      {edit && <UserModal user={edit} roles={roles} users={users} departamentos={departamentos} onClose={() => { setEdit(null); setCreating(false); }} onSave={save} />}
     </div>
   );
 }
 
-function UserModal({ user, roles, users, onClose, onSave }: { user: User; roles: Role[]; users: User[]; onClose: () => void; onSave: (u: User) => void }) {
+function UserModal({ user, roles, users, departamentos, onClose, onSave }: { user: User; roles: Role[]; users: User[]; departamentos: Departamento[]; onClose: () => void; onSave: (u: User) => void }) {
   const [u, setU] = useState<User>(user);
   const set = (k: keyof User, v: any) => setU((x) => ({ ...x, [k]: v }));
   return (
@@ -214,6 +219,15 @@ function UserModal({ user, roles, users, onClose, onSave }: { user: User; roles:
         <div>
           <label className="ckl-label">Empresa</label>
           <input className="ckl-input" value={u.empresa} onChange={(e) => set("empresa", e.target.value)} />
+        </div>
+        <div className="col-span-2">
+          <label className="ckl-label">Departamento</label>
+          <select className="ckl-input" value={u.departamento_id ?? ""} onChange={(e) => set("departamento_id", e.target.value ? +e.target.value : null)}>
+            <option value="">— Sin departamento —</option>
+            {/* Los inactivos solo aparecen si el usuario ya lo tenía asignado. */}
+            {departamentos.filter((d) => d.activo || d.id === u.departamento_id).map((d) => <option key={d.id} value={d.id}>{d.nombre}{d.activo ? "" : " (inactivo)"}</option>)}
+          </select>
+          <p className="mt-1 text-[11px] text-muted-foreground">Sus viajes autorizados descuentan del presupuesto de este departamento.</p>
         </div>
         <div className="col-span-2">
           <label className="ckl-label">Jefe</label>

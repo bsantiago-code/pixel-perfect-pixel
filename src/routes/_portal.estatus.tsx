@@ -42,6 +42,7 @@ import {
   avanceValidacion,
   bloqueoMontoHotel,
   estatusVisible,
+  evaluarPresupuestoFolio,
   pasoAutorizacion,
   requiereAccion,
   ESTATUS_VISIBLES,
@@ -49,6 +50,7 @@ import {
   type Hotel,
 } from "@/lib/store";
 import { Paginacion, usePaginacion } from "@/components/portal/Paginacion";
+import { PresupuestoFolioCard } from "@/components/portal/PresupuestoFolioCard";
 import { CompensarViajeDialog, ResumenCompensado } from "@/components/portal/CompensarViajeDialog";
 import { StatusBadge } from "./_portal.dashboard";
 
@@ -141,6 +143,12 @@ function Estatus() {
   // Folio bloqueado para autorizar por monto manual de hotel (si el parámetro está activo).
   const bloqueoDe = (s: Solicitud) =>
     s.estatus === "Abierto" ? bloqueoMontoHotel(s.folio, revisionesMonto, config) : null;
+  // Presupuesto del departamento del folio abierto en el detalle (solo llega a quien autoriza o administra
+  // presupuestos). Con el parámetro de bloqueo activo, un folio que excede no se puede autorizar.
+  const infoPresupuesto = detail && detalle?.solicitud.id === detail.id ? detalle.presupuesto : undefined;
+  const evalPresupuesto = detail ? evaluarPresupuestoFolio(infoPresupuesto, detail, config) : null;
+  const bloqueoAutorizar = (s: Solicitud) =>
+    bloqueoDe(s) ?? (detail?.id === s.id ? (evalPresupuesto?.bloqueo ?? null) : null);
   const marcaBloqueo = (s: Solicitud) => {
     const motivo = bloqueoDe(s);
     return motivo ? (
@@ -577,6 +585,16 @@ function Estatus() {
           </dl>
           <p className="mt-3 text-xs"><b>Motivo:</b> {detail.motivo}</p>
 
+          {/* Presupuesto del departamento: arriba, para verlo antes de autorizar sin desplazarse. */}
+          {infoPresupuesto && evalPresupuesto && detail.estatus !== "Rechazado" && (
+            <PresupuestoFolioCard
+              info={infoPresupuesto}
+              folio={detail}
+              evaluacion={evalPresupuesto}
+              puedeGestionar={hasPerm("gestionar_presupuestos")}
+            />
+          )}
+
           {resumenMontos.length > 0 && (
             <div className="mt-4 border-t pt-3">
               <div className="text-xs font-semibold">Resumen de montos</div>
@@ -795,8 +813,8 @@ function Estatus() {
                 <button onClick={() => setRejecting(detail)} className="ckl-btn-outline"><X size={14} /> Rechazar</button>
                 <button
                   onClick={() => authorize(detail)}
-                  disabled={!!bloqueoDe(detail)}
-                  title={bloqueoDe(detail) ?? undefined}
+                  disabled={!!bloqueoAutorizar(detail)}
+                  title={bloqueoAutorizar(detail) ?? undefined}
                   className="ckl-btn-primary"
                 >
                   <Check size={14} /> Autorizar

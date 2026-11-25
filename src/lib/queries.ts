@@ -11,9 +11,12 @@ import type {
   ResumenCompensacion,
   Convenio,
   CorreoSimulado,
+  Departamento,
   Factura,
   Hotel,
   LogEvento,
+  Presupuesto,
+  PresupuestoFolio,
   RenglonGasto,
   RevisionMontoManual,
   Role,
@@ -55,6 +58,7 @@ export type Config = {
   notif_plataforma_activo: boolean;
   revision_automatica_activo: boolean;
   bloquear_folio_monto_hotel: boolean;
+  bloquear_autorizacion_sin_presupuesto: boolean;
   palabras_prohibidas_alcohol: string[];
   palabras_prohibidas_tabaco: string[];
   palabras_prohibidas_higiene: string[];
@@ -78,6 +82,7 @@ export const CONFIG_DEFAULTS: Config = {
   notif_plataforma_activo: true,
   revision_automatica_activo: true,
   bloquear_folio_monto_hotel: false,
+  bloquear_autorizacion_sin_presupuesto: false,
   palabras_prohibidas_alcohol: PALABRAS_DEFAULT.alcohol,
   palabras_prohibidas_tabaco: PALABRAS_DEFAULT.tabaco,
   palabras_prohibidas_higiene: PALABRAS_DEFAULT.higiene,
@@ -110,6 +115,8 @@ export type SolicitudDetalle = {
   solicitud: Solicitud;
   destinos: DestinoApi[];
   autorizaciones: Autorizacion[];
+  // Solo para quien autoriza o administra presupuestos.
+  presupuesto?: PresupuestoFolio;
 };
 
 export type Bloqueo = { mensaje: string | null; folios: string[] };
@@ -180,6 +187,29 @@ export const useFacturas = (solicitudId: string | null | undefined) =>
     queryKey: ["facturas", solicitudId],
     queryFn: () => api.get<Factura[]>(`/facturas?solicitud_id=${solicitudId}`),
     enabled: !!solicitudId,
+  });
+
+export const useDepartamentos = () =>
+  useQuery({ queryKey: ["departamentos"], queryFn: () => api.get<Departamento[]>("/departamentos") });
+
+export type PresupuestosResp = { presupuestos: Presupuesto[]; usuarios_sin_departamento: number };
+export const usePresupuestos = (enabled = true) =>
+  useQuery({ queryKey: ["presupuestos"], queryFn: () => api.get<PresupuestosResp>("/presupuestos"), enabled });
+
+export type FolioPresupuesto = {
+  id: string;
+  folio: string;
+  fecha: string;
+  estatus: Solicitud["estatus"];
+  monto_total: number;
+  destino_resumen: string;
+  usuario: string;
+};
+export const useFoliosPresupuesto = (id: string | null) =>
+  useQuery({
+    queryKey: ["presupuesto-folios", id],
+    queryFn: () => api.get<FolioPresupuesto[]>(`/presupuestos/${id}/folios`),
+    enabled: !!id,
   });
 
 export const useConvenios = (enabled = true) =>

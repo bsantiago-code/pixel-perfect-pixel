@@ -99,7 +99,7 @@ const CONFIG_KEYS = new Set([
   "dias_comprobacion_atrasada", "dias_autorizacion_pendiente", "dias_recordatorio_viaje",
   "notif_email_activo", "notif_email_destinatarios", "smtp_servidor", "smtp_puerto", "smtp_usuario",
   "smtp_password", "smtp_cifrado", "smtp_remitente", "notif_plataforma_activo", "revision_automatica_activo",
-  "bloquear_folio_monto_hotel", ...Object.keys(LISTAS_KEYS),
+  "bloquear_folio_monto_hotel", "bloquear_autorizacion_sin_presupuesto", ...Object.keys(LISTAS_KEYS),
 ]);
 
 adminRouter.put("/config", requirePerm("configurar_montos"), async (req, res) => {
@@ -135,6 +135,18 @@ adminRouter.put("/config", requirePerm("configurar_montos"), async (req, res) =>
       await c.query("CALL sp_registrar_log(?, ?, ?, ?, ?)", [
         "config_bloqueo_monto_hotel", "config", "bloquear_folio_monto_hotel", auth.user.id,
         JSON.stringify({ antes: !!antes.bloquear_folio_monto_hotel, despues: !!body.bloquear_folio_monto_hotel }),
+      ]);
+    }
+    if (
+      "bloquear_autorizacion_sin_presupuesto" in body &&
+      !!antes.bloquear_autorizacion_sin_presupuesto !== !!body.bloquear_autorizacion_sin_presupuesto
+    ) {
+      await c.query("CALL sp_registrar_log(?, ?, ?, ?, ?)", [
+        "config_bloqueo_presupuesto", "config", "bloquear_autorizacion_sin_presupuesto", auth.user.id,
+        JSON.stringify({
+          antes: !!antes.bloquear_autorizacion_sin_presupuesto,
+          despues: !!body.bloquear_autorizacion_sin_presupuesto,
+        }),
       ]);
     }
   }, auth.user.id);
@@ -297,7 +309,7 @@ adminRouter.put("/roles/permisos", requirePerm("configurar_permisos"), async (re
 });
 
 // ───────── usuarios ─────────
-const COLS = "id, nombre, correo, rfc, rol_id, empresa, jefe_id, activo, initials";
+const COLS = "id, nombre, correo, rfc, rol_id, empresa, jefe_id, activo, initials, departamento_id";
 
 adminRouter.get("/usuarios", async (_req, res) => {
   const list = await rows<R>(`SELECT ${COLS} FROM usuarios ORDER BY nombre`);
@@ -313,6 +325,8 @@ const userSchema = z.object({
   jefe_id: z.string().nullable().optional(),
   activo: z.boolean().default(true),
   initials: z.string().default(""),
+  // Departamento cuyo presupuesto descuentan sus viajes (opcional).
+  departamento_id: z.number().int().nullable().optional(),
   password: z.string().optional(),
 });
 
@@ -329,9 +343,10 @@ adminRouter.post("/usuarios", requirePerm("gestionar_usuarios"), async (req, res
   }
   const id = newId("u_");
   await exec(
-    `INSERT INTO usuarios (id, nombre, correo, password, rfc, rol_id, empresa, jefe_id, activo, initials)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [id, u.nombre, u.correo, await hashPassword(u.password), u.rfc, u.rol_id, u.empresa, u.jefe_id ?? null, u.activo, u.initials],
+    `INSERT INTO usuarios (id, nombre, correo, password, rfc, rol_id, empresa, jefe_id, activo, initials, departamento_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [id, u.nombre, u.correo, await hashPassword(u.password), u.rfc, u.rol_id, u.empresa, u.jefe_id ?? null, u.activo,
+      u.initials, u.departamento_id ?? null],
   );
   res.status(201).json(toAuthUser((await one<R>(`SELECT ${COLS} FROM usuarios WHERE id = ?`, [id]))!));
 });
@@ -346,11 +361,17 @@ adminRouter.put("/usuarios/:id", requirePerm("gestionar_usuarios"), async (req, 
   }
   const sets = ["nombre = ?", "correo = ?", "rfc = ?", "rol_id = ?", "empresa = ?", "jefe_id = ?", "activo = ?", "initials = ?"];
   const params: unknown[] = [u.nombre, u.correo, u.rfc, u.rol_id, u.empresa, u.jefe_id ?? null, u.activo, u.initials];
+  // Sin la clave en el cuerpo (p. ej. el interruptor de Activo) se conserva el departamento actual.
+  if (u.departamento_id !== undefined) {
+    sets.push("departamento_id = ?");
+    params.push(u.departamento_id);
+  }
   if (u.password) {
     sets.push("password = ?");
     params.push(await hashPassword(u.password));
   }
-  await exec(`UPDATE usuarios SET ${sets.join(", ")} WHERE id = ?`, [...params, req.params.id]);
+  // En transacción para que trg_usuarios_au registre en la bitácora quién cambió el departamento.
+  await tx((c) => exec(`UPDATE usuarios SET ${sets.join(", ")} WHERE id = ?`, [...params, req.params.id], c), me(req).user.id);
   res.json(toAuthUser((await one<R>(`SELECT ${COLS} FROM usuarios WHERE id = ?`, [req.params.id]))!));
 });
 
@@ -359,7 +380,7 @@ adminRouter.get("/prealtas", requirePerm("gestionar_usuarios"), async (_req, res
 });
 
 // ───────── bitácora y correos simulados ─────────
-adminRouter.get("/logs", requirePerm("configurar_montos", "ver_reportes", "gestionar_convenios"), async (req, res) => {
+adminRouter.get("/logs", requirePerm("configurar_montos", "ver_reportes", "gestionar_convenios", "gestionar_presupuestos"), async (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 200, 1000);
   const entidad = typeof req.query.entidad === "string" ? req.query.entidad : null;
   const entidadId = typeof req.query.entidad_id === "string" ? req.query.entidad_id : null;

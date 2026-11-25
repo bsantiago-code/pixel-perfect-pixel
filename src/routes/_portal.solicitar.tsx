@@ -577,7 +577,7 @@ function Tot({ label, v }: { label: string; v: number }) {
 // el navegador (los <input type="date"> nativos usan el formato/locale del
 // navegador — en Safari puede no ser dd/mm/aaaa). value/onChange usan el mismo
 // formato ISO (yyyy-mm-dd) que ya maneja el resto de las validaciones.
-function DateField({
+export function DateField({
   value,
   onChange,
   min,

@@ -26,6 +26,7 @@ SET SQL_MODE = 'STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION,ERROR_FOR_DIVISION_BY
 
 -- ───────────────────────────── 1. Limpieza ─────────────────────────────
 DROP VIEW IF EXISTS v_renglones_gasto;
+DROP VIEW IF EXISTS v_presupuestos;
 DROP PROCEDURE IF EXISTS sp_siguiente_folio;
 DROP PROCEDURE IF EXISTS sp_registrar_log;
 DROP PROCEDURE IF EXISTS sp_autorizar_solicitud;
@@ -36,11 +37,12 @@ DROP PROCEDURE IF EXISTS sp_sincronizar_catalogo_convenios;
 DROP PROCEDURE IF EXISTS sp_dar_baja_convenio;
 DROP PROCEDURE IF EXISTS sp_reactivar_convenio;
 DROP PROCEDURE IF EXISTS sp_gasto_por_concepto;
+DROP PROCEDURE IF EXISTS sp_validar_presupuesto;
 
-DROP TABLE IF EXISTS compensaciones, logs, correos, revisiones_monto, convenios, factura_archivos, facturas,
+DROP TABLE IF EXISTS presupuestos, compensaciones, logs, correos, revisiones_monto, convenios, factura_archivos, facturas,
   comprobantes_gasto, notas, autorizaciones, destino_vales, destino_transportes, destino_hoteles,
   solicitud_destinos, solicitudes, sesiones, reset_codes, prealtas, usuarios, folio_contador,
-  configuracion, estados_mx, origenes, hoteles, sociedades, roles;
+  configuracion, estados_mx, origenes, hoteles, sociedades, departamentos, roles;
 
 -- ───────────────────────────── 2. Tablas ─────────────────────────────
 -- Catálogos ---------------------------------------------------------------
@@ -62,6 +64,16 @@ CREATE TABLE sociedades (
   sociedad_sap  VARCHAR(20)  NOT NULL DEFAULT '',
   PRIMARY KEY (id),
   UNIQUE KEY uq_sociedades_nombre (nombre)
+) ENGINE=InnoDB;
+
+-- Departamentos (Comercial, Auditoría…): cada uno tiene sus bolsas de presupuesto (tabla presupuestos).
+-- No se borran: se desactivan (activo = 0) para conservar el historial de folios y presupuestos.
+CREATE TABLE departamentos (
+  id      INT          NOT NULL AUTO_INCREMENT,
+  nombre  VARCHAR(80)  NOT NULL,
+  activo  TINYINT(1)   NOT NULL DEFAULT 1,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_departamentos_nombre (nombre)
 ) ENGINE=InnoDB;
 
 CREATE TABLE hoteles (
@@ -115,12 +127,15 @@ CREATE TABLE usuarios (
   jefe_id   VARCHAR(40)  NULL,
   activo    TINYINT(1)   NOT NULL DEFAULT 1,
   initials  VARCHAR(4)   NOT NULL DEFAULT '',
+  departamento_id INT    NULL COMMENT 'Departamento cuyo presupuesto descuentan sus viajes',
   PRIMARY KEY (id),
   UNIQUE KEY uq_usuarios_correo (correo),
   UNIQUE KEY uq_usuarios_rfc (rfc),
   KEY ix_usuarios_jefe (jefe_id),
-  CONSTRAINT fk_usuarios_rol  FOREIGN KEY (rol_id)  REFERENCES roles (id)    ON DELETE RESTRICT,
-  CONSTRAINT fk_usuarios_jefe FOREIGN KEY (jefe_id) REFERENCES usuarios (id) ON DELETE SET NULL
+  KEY ix_usuarios_depto (departamento_id),
+  CONSTRAINT fk_usuarios_rol   FOREIGN KEY (rol_id)          REFERENCES roles (id)         ON DELETE RESTRICT,
+  CONSTRAINT fk_usuarios_jefe  FOREIGN KEY (jefe_id)         REFERENCES usuarios (id)      ON DELETE SET NULL,
+  CONSTRAINT fk_usuarios_depto FOREIGN KEY (departamento_id) REFERENCES departamentos (id) ON DELETE RESTRICT
 ) ENGINE=InnoDB;
 
 CREATE TABLE prealtas (
@@ -178,12 +193,15 @@ CREATE TABLE solicitudes (
                      COMMENT 'Cerrado = autorizada y lista para comprobar',
   comprobante_viaje  VARCHAR(255)  NULL,
   nota_rechazo       TEXT          NULL,
+  departamento_id    INT           NULL COMMENT 'Departamento del solicitante al crear el folio (lo copia trg_solicitudes_bi); su presupuesto es el que descuenta',
   created_at         DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   PRIMARY KEY (id),
   UNIQUE KEY uq_solicitudes_folio (folio),
   KEY ix_solicitudes_user (user_id, created_at),
   KEY ix_solicitudes_estatus (estatus),
-  CONSTRAINT fk_solicitudes_usuario FOREIGN KEY (user_id) REFERENCES usuarios (id) ON DELETE RESTRICT
+  KEY ix_solicitudes_depto (departamento_id, estatus, fecha),
+  CONSTRAINT fk_solicitudes_usuario FOREIGN KEY (user_id)         REFERENCES usuarios (id)      ON DELETE RESTRICT,
+  CONSTRAINT fk_solicitudes_depto   FOREIGN KEY (departamento_id) REFERENCES departamentos (id) ON DELETE RESTRICT
 ) ENGINE=InnoDB;
 
 CREATE TABLE solicitud_destinos (
@@ -389,6 +407,26 @@ CREATE TABLE compensaciones (
   CONSTRAINT fk_comp_solicitud FOREIGN KEY (solicitud_id) REFERENCES solicitudes (folio) ON DELETE CASCADE ON UPDATE CASCADE
 ) ENGINE=InnoDB;
 
+-- Bolsas de presupuesto por departamento (Admin/Finanzas, permiso gestionar_presupuestos). Por omisión una por
+-- mes, pero el rango de fechas es libre (Finanzas puede renovarla cuando lo necesite). Los periodos de un mismo
+-- departamento no se empalman (trg_presupuestos_bi/bu), así cada folio cae en una sola bolsa: la que cubre su
+-- fecha de solicitud. Lo ejercido NO se guarda: lo calcula v_presupuestos con los folios autorizados (Cerrado),
+-- así una reversión o un rechazo regresan el monto solos.
+CREATE TABLE presupuestos (
+  id               VARCHAR(40)   NOT NULL,
+  departamento_id  INT           NOT NULL,
+  fecha_inicio     DATE          NOT NULL,
+  fecha_fin        DATE          NOT NULL,
+  monto            DECIMAL(12,2) NOT NULL COMMENT 'Monto asignado a la bolsa',
+  notas            VARCHAR(500)  NULL,
+  creado_por       VARCHAR(40)   NULL,
+  creado_at        DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  actualizado_at   DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (id),
+  KEY ix_presupuestos_depto (departamento_id, fecha_inicio, fecha_fin),
+  CONSTRAINT fk_presupuestos_depto FOREIGN KEY (departamento_id) REFERENCES departamentos (id) ON DELETE RESTRICT
+) ENGINE=InnoDB;
+
 CREATE TABLE correos (
   id          VARCHAR(40)  NOT NULL,
   fecha       DATETIME(3)  NOT NULL,
@@ -426,9 +464,17 @@ INSERT INTO roles (id, nombre, permisos) VALUES
   (1, 'usuario', '{"solicitar":true,"ver_propio":true,"comprobar":true,"ver_equipo":false,"ver_todo":false,"autorizar_lte5000":false,"autorizar_gt5000":false,"rechazar":false,"subir_comprobantes_viaje":false,"ver_reportes":false,"exportar_reportes":false,"gestionar_usuarios":false,"configurar_permisos":false,"configurar_montos":false}'),
   (2, 'jefe_inmediato', '{"solicitar":true,"ver_propio":true,"comprobar":false,"ver_equipo":true,"ver_todo":false,"autorizar_lte5000":true,"autorizar_gt5000":false,"rechazar":true,"subir_comprobantes_viaje":false,"ver_reportes":true,"exportar_reportes":false,"gestionar_usuarios":false,"configurar_permisos":false,"configurar_montos":false}'),
   (3, 'gestor_vuelos', '{"solicitar":false,"ver_propio":false,"comprobar":true,"ver_equipo":false,"ver_todo":true,"autorizar_lte5000":false,"autorizar_gt5000":false,"rechazar":false,"subir_comprobantes_viaje":true,"ver_reportes":false,"exportar_reportes":false,"gestionar_usuarios":false,"configurar_permisos":false,"configurar_montos":false}'),
-  (4, 'finanzas', '{"compensar_viaje":true,"solicitar":true,"ver_propio":true,"comprobar":false,"ver_equipo":false,"ver_todo":true,"autorizar_lte5000":false,"autorizar_gt5000":true,"rechazar":true,"subir_comprobantes_viaje":false,"ver_reportes":true,"exportar_reportes":true,"gestionar_usuarios":false,"configurar_permisos":false,"configurar_montos":false,"ver_gasto_por_concepto":true}'),
-  (5, 'administrador', '{"solicitar":true,"ver_propio":true,"comprobar":true,"ver_equipo":true,"ver_todo":true,"autorizar_lte5000":true,"autorizar_gt5000":true,"rechazar":true,"subir_comprobantes_viaje":true,"ver_reportes":true,"exportar_reportes":true,"gestionar_usuarios":true,"configurar_permisos":true,"configurar_montos":true,"ver_gasto_por_concepto":true}'),
+  (4, 'finanzas', '{"compensar_viaje":true,"solicitar":true,"ver_propio":true,"comprobar":false,"ver_equipo":false,"ver_todo":true,"autorizar_lte5000":false,"autorizar_gt5000":true,"rechazar":true,"subir_comprobantes_viaje":false,"ver_reportes":true,"exportar_reportes":true,"gestionar_usuarios":false,"configurar_permisos":false,"configurar_montos":false,"ver_gasto_por_concepto":true,"gestionar_presupuestos":true}'),
+  (5, 'administrador', '{"solicitar":true,"ver_propio":true,"comprobar":true,"ver_equipo":true,"ver_todo":true,"autorizar_lte5000":true,"autorizar_gt5000":true,"rechazar":true,"subir_comprobantes_viaje":true,"ver_reportes":true,"exportar_reportes":true,"gestionar_usuarios":true,"configurar_permisos":true,"configurar_montos":true,"ver_gasto_por_concepto":true,"gestionar_presupuestos":true}'),
   (6, 'compras_corporativas', '{"compensar_viaje":true,"validar_comprobacion":true,"revisar_monto_manual":true,"gestionar_convenios":true,"solicitar":true,"ver_propio":true,"comprobar":false,"ver_equipo":false,"ver_todo":true,"autorizar_lte5000":false,"autorizar_gt5000":true,"rechazar":true,"subir_comprobantes_viaje":false,"ver_reportes":true,"exportar_reportes":true,"gestionar_usuarios":false,"configurar_permisos":false,"configurar_montos":false,"ver_gasto_por_concepto":true}');
+
+-- departamentos (los de la columna "Depto o sucursal" de la hoja de pagos a hoteles)
+INSERT INTO departamentos (id, nombre) VALUES
+  (1, 'Comercial'),
+  (2, 'Auditoría'),
+  (3, 'Calidad'),
+  (4, 'Apoyo'),
+  (5, 'Movilidad');
 
 -- sociedades
 INSERT INTO sociedades (id, nombre, rfc, regimen, cp, uso_cfdi, sociedad_sap) VALUES
@@ -544,6 +590,8 @@ INSERT INTO configuracion (clave, valor) VALUES
   ('notif_plataforma_activo', 'true'),
   ('revision_automatica_activo', 'true'),
   ('bloquear_folio_monto_hotel', 'false'),
+  -- Presupuestos por departamento: true = no se autoriza un folio que exceda el disponible de su bolsa.
+  ('bloquear_autorizacion_sin_presupuesto', 'false'),
   -- Palabras que rechazan una factura al subirla (Configuración → Productos no permitidos en facturas).
   ('palabras_prohibidas_alcohol', '["cerveza","vino","tequila","mezcal","whisky","whiskey","ron","vodka","ginebra","brandy","coñac","cognac","licor","sidra","champagne","champaña","aguardiente","bacardi","destilado"]'),
   ('palabras_prohibidas_tabaco', '["cigarro","cigarrillo","cigarrillos","vape","vapeador","tabaco","puro","nicotina","habano"]'),
@@ -1084,6 +1132,39 @@ CREATE VIEW v_renglones_gasto AS
    GROUP BY s.id, s.folio, s.user_id, s.empresa, DATE(s.created_at)
   HAVING SUM(d.gasolina) > 0;
 
+-- Estado de cada bolsa de presupuesto. Un folio cuenta en la bolsa de su departamento cuyo rango cubre la
+-- fecha de la solicitud. ejercido = monto total de los folios autorizados (Cerrado); por_autorizar = folios aún
+-- Abiertos (informativo, no descuenta); comprobado = lo comprobado con facturas de los folios autorizados.
+CREATE VIEW v_presupuestos AS
+  SELECT p.id, p.departamento_id, d.nombre AS departamento, d.activo AS departamento_activo,
+         p.fecha_inicio, p.fecha_fin, p.monto, p.notas, p.creado_por, p.creado_at, p.actualizado_at,
+         COALESCE(a.ejercido, 0)                AS ejercido,
+         COALESCE(a.folios, 0)                  AS folios_autorizados,
+         COALESCE(a.comprobado, 0)              AS comprobado,
+         COALESCE(pa.por_autorizar, 0)          AS por_autorizar,
+         COALESCE(pa.folios, 0)                 AS folios_por_autorizar,
+         p.monto - COALESCE(a.ejercido, 0)      AS disponible
+    FROM presupuestos p
+    JOIN departamentos d ON d.id = p.departamento_id
+    LEFT JOIN (
+      SELECT p2.id AS presupuesto_id, SUM(s.monto_total) AS ejercido, COUNT(*) AS folios,
+             SUM((SELECT COALESCE(SUM(c.monto_comprobado), 0) FROM comprobantes_gasto c
+                   WHERE c.solicitud_id = s.folio)) AS comprobado
+        FROM presupuestos p2
+        JOIN solicitudes s ON s.departamento_id = p2.departamento_id
+                          AND s.fecha BETWEEN p2.fecha_inicio AND p2.fecha_fin
+       WHERE s.estatus = 'Cerrado'
+       GROUP BY p2.id
+    ) a ON a.presupuesto_id = p.id
+    LEFT JOIN (
+      SELECT p3.id AS presupuesto_id, SUM(s.monto_total) AS por_autorizar, COUNT(*) AS folios
+        FROM presupuestos p3
+        JOIN solicitudes s ON s.departamento_id = p3.departamento_id
+                          AND s.fecha BETWEEN p3.fecha_inicio AND p3.fecha_fin
+       WHERE s.estatus = 'Abierto'
+       GROUP BY p3.id
+    ) pa ON pa.presupuesto_id = p.id;
+
 -- ───────────────────────────── 5. Procedimientos almacenados ─────────────────────────────
 DELIMITER $$
 
@@ -1126,6 +1207,13 @@ BEGIN
   DECLARE v_umbral DECIMAL(12,2) DEFAULT 5000;
   DECLARE v_bloquear TINYINT(1) DEFAULT 0;
   DECLARE v_paso VARCHAR(20) DEFAULT NULL;
+  DECLARE v_depto INT DEFAULT NULL;
+  DECLARE v_depto_nombre VARCHAR(80) DEFAULT NULL;
+  DECLARE v_fecha DATE;
+  DECLARE v_presupuesto VARCHAR(40) DEFAULT NULL;
+  DECLARE v_disponible DECIMAL(14,2) DEFAULT NULL;
+  DECLARE v_bloquear_pres TINYINT(1) DEFAULT 0;
+  DECLARE v_msg VARCHAR(255);
 
   DECLARE EXIT HANDLER FOR SQLEXCEPTION
   BEGIN
@@ -1144,8 +1232,8 @@ BEGIN
     SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'La solicitud no existe.';
   END IF;
 
-  SELECT user_id, estatus, jefe_status, finanzas_status, monto_total, folio
-    INTO v_owner, v_estatus, v_jefe, v_fin, v_monto, v_folio
+  SELECT user_id, estatus, jefe_status, finanzas_status, monto_total, folio, departamento_id, fecha
+    INTO v_owner, v_estatus, v_jefe, v_fin, v_monto, v_folio, v_depto, v_fecha
     FROM solicitudes WHERE id = p_solicitud_id FOR UPDATE;
 
   SELECT COALESCE(JSON_UNQUOTE(JSON_EXTRACT(r.permisos, '$.autorizar_lte5000')) = 'true', 0),
@@ -1193,6 +1281,32 @@ BEGIN
   IF EXISTS (SELECT 1 FROM autorizaciones WHERE solicitud_id = v_folio AND user_id = p_user_id) THEN
     SIGNAL SQLSTATE '45000'
       SET MESSAGE_TEXT = 'Ya registraste una decisión en esta solicitud; el siguiente paso lo debe dar otra persona.';
+  END IF;
+
+  -- Presupuesto del departamento: el folio aún está Abierto, así que no está contado en lo ejercido.
+  -- Si no hay bolsa que cubra la fecha o el disponible no alcanza, se registra en la bitácora y, con el
+  -- parámetro bloquear_autorizacion_sin_presupuesto activo, no se autoriza. Folios sin departamento no aplican.
+  IF p_decision = 'autorizado' AND v_depto IS NOT NULL THEN
+    SELECT nombre INTO v_depto_nombre FROM departamentos WHERE id = v_depto;
+    SELECT id, disponible INTO v_presupuesto, v_disponible
+      FROM v_presupuestos
+     WHERE departamento_id = v_depto AND v_fecha BETWEEN fecha_inicio AND fecha_fin
+     LIMIT 1;
+    IF v_presupuesto IS NULL OR v_disponible < v_monto THEN
+      SELECT COALESCE(JSON_UNQUOTE(valor) = 'true', 0) INTO v_bloquear_pres
+        FROM configuracion WHERE clave = 'bloquear_autorizacion_sin_presupuesto';
+      IF v_bloquear_pres = 1 THEN
+        SET v_msg = IF(v_presupuesto IS NULL,
+          CONCAT('Bloqueado: el departamento ', v_depto_nombre, ' no tiene presupuesto para el ',
+                 DATE_FORMAT(v_fecha, '%d/%m/%Y'), '.'),
+          CONCAT('Bloqueado: el folio ', v_folio, ' ($', FORMAT(v_monto, 0), ') excede el presupuesto disponible de ',
+                 v_depto_nombre, ' ($', FORMAT(v_disponible, 0), ').'));
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = v_msg;
+      END IF;
+      CALL sp_registrar_log('autorizacion_sobre_presupuesto', 'solicitud', p_solicitud_id, p_user_id,
+        JSON_OBJECT('folio', v_folio, 'departamento', v_depto_nombre, 'paso', v_paso, 'monto', v_monto,
+                    'presupuesto_id', v_presupuesto, 'disponible', v_disponible));
+    END IF;
   END IF;
 
   INSERT INTO autorizaciones (solicitud_id, rol_autorizador, user_id, user_nombre, status, fecha, nota)
@@ -1394,6 +1508,38 @@ BEGIN
    ORDER BY monto DESC, categoria, subconcepto;
 END$$
 
+-- Reglas de una bolsa de presupuesto (las llaman trg_presupuestos_bi/bu): fechas en orden, monto no negativo,
+-- departamento existente y sin empalme con otra bolsa del mismo departamento.
+CREATE PROCEDURE sp_validar_presupuesto(
+  IN p_id VARCHAR(40), IN p_depto INT, IN p_inicio DATE, IN p_fin DATE, IN p_monto DECIMAL(12,2))
+BEGIN
+  DECLARE v_ini DATE DEFAULT NULL;
+  DECLARE v_fin DATE DEFAULT NULL;
+  DECLARE v_msg VARCHAR(255);
+  IF p_inicio IS NULL OR p_fin IS NULL THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Captura la fecha inicial y la final del presupuesto.';
+  END IF;
+  IF p_fin < p_inicio THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'La fecha final del presupuesto no puede ser anterior a la inicial.';
+  END IF;
+  IF p_monto IS NULL OR p_monto < 0 THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'El monto del presupuesto no puede ser negativo.';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM departamentos WHERE id = p_depto) THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'El departamento no existe.';
+  END IF;
+  SELECT fecha_inicio, fecha_fin INTO v_ini, v_fin
+    FROM presupuestos
+   WHERE departamento_id = p_depto AND id <> p_id AND fecha_inicio <= p_fin AND fecha_fin >= p_inicio
+   ORDER BY fecha_inicio
+   LIMIT 1;
+  IF v_ini IS NOT NULL THEN
+    SET v_msg = CONCAT('Las fechas se empalman con otro presupuesto del mismo departamento (',
+                       DATE_FORMAT(v_ini, '%d/%m/%Y'), ' al ', DATE_FORMAT(v_fin, '%d/%m/%Y'), ').');
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = v_msg;
+  END IF;
+END$$
+
 -- ───────────────────────────── 6. Triggers ─────────────────────────────
 
 -- Usuarios: nadie es su propio jefe.
@@ -1411,18 +1557,37 @@ BEGIN
   END IF;
 END$$
 
--- Autorizaciones.user_nombre siempre es el nombre vigente del usuario: se fija al insertar y se propaga
--- cuando se renombra al usuario.
+-- Usuarios: autorizaciones.user_nombre siempre es el nombre vigente del usuario (se propaga al renombrar).
+-- Al asignarle departamento a quien no tenía, sus folios sin departamento pasan a ese departamento
+-- (para que cuenten en su presupuesto). Un cambio de departamento NO mueve los folios ya registrados.
 CREATE TRIGGER trg_usuarios_au AFTER UPDATE ON usuarios FOR EACH ROW
 BEGIN
   IF NOT (NEW.nombre <=> OLD.nombre) THEN
     UPDATE autorizaciones SET user_nombre = NEW.nombre WHERE user_id = NEW.id;
+  END IF;
+  IF OLD.departamento_id IS NULL AND NEW.departamento_id IS NOT NULL THEN
+    UPDATE solicitudes SET departamento_id = NEW.departamento_id
+     WHERE user_id = NEW.id AND departamento_id IS NULL;
+  END IF;
+  IF NOT (OLD.departamento_id <=> NEW.departamento_id) THEN
+    CALL sp_registrar_log('usuario_departamento', 'usuario', NEW.id, @ckl_usuario_id,
+      JSON_OBJECT('usuario', NEW.nombre,
+                  'antes', (SELECT nombre FROM departamentos WHERE id = OLD.departamento_id),
+                  'despues', (SELECT nombre FROM departamentos WHERE id = NEW.departamento_id)));
   END IF;
 END$$
 
 CREATE TRIGGER trg_autorizaciones_bi BEFORE INSERT ON autorizaciones FOR EACH ROW
 BEGIN
   SET NEW.user_nombre = (SELECT nombre FROM usuarios WHERE id = NEW.user_id);
+END$$
+
+-- Solicitudes: el folio toma el departamento de su solicitante al crearse (y ya no cambia).
+CREATE TRIGGER trg_solicitudes_bi BEFORE INSERT ON solicitudes FOR EACH ROW
+BEGIN
+  IF NEW.departamento_id IS NULL THEN
+    SET NEW.departamento_id = (SELECT departamento_id FROM usuarios WHERE id = NEW.user_id);
+  END IF;
 END$$
 
 -- Solicitudes: bitácora y reglas de edición/borrado.
@@ -1634,6 +1799,46 @@ BEGIN
       JSON_OBJECT('folio', NEW.folio, 'hotel', NEW.hotel_nombre, 'monto_manual', NEW.monto_manual,
                   'comentario', NEW.comentario));
   END IF;
+END$$
+
+-- Presupuestos: validación y bitácora (alta, modificación con antes/después, baja).
+CREATE TRIGGER trg_presupuestos_bi BEFORE INSERT ON presupuestos FOR EACH ROW
+BEGIN
+  CALL sp_validar_presupuesto(NEW.id, NEW.departamento_id, NEW.fecha_inicio, NEW.fecha_fin, NEW.monto);
+END$$
+
+CREATE TRIGGER trg_presupuestos_bu BEFORE UPDATE ON presupuestos FOR EACH ROW
+BEGIN
+  CALL sp_validar_presupuesto(NEW.id, NEW.departamento_id, NEW.fecha_inicio, NEW.fecha_fin, NEW.monto);
+END$$
+
+CREATE TRIGGER trg_presupuestos_ai AFTER INSERT ON presupuestos FOR EACH ROW
+BEGIN
+  CALL sp_registrar_log('presupuesto_alta', 'presupuesto', NEW.id, @ckl_usuario_id,
+    JSON_OBJECT('departamento', (SELECT nombre FROM departamentos WHERE id = NEW.departamento_id),
+                'fecha_inicio', NEW.fecha_inicio, 'fecha_fin', NEW.fecha_fin, 'monto', NEW.monto,
+                'notas', NEW.notas));
+END$$
+
+CREATE TRIGGER trg_presupuestos_au AFTER UPDATE ON presupuestos FOR EACH ROW
+BEGIN
+  IF NOT (OLD.fecha_inicio <=> NEW.fecha_inicio AND OLD.fecha_fin <=> NEW.fecha_fin
+          AND OLD.monto <=> NEW.monto AND OLD.notas <=> NEW.notas
+          AND OLD.departamento_id <=> NEW.departamento_id) THEN
+    CALL sp_registrar_log('presupuesto_modificacion', 'presupuesto', NEW.id, @ckl_usuario_id,
+      JSON_OBJECT('departamento', (SELECT nombre FROM departamentos WHERE id = NEW.departamento_id),
+                  'antes', JSON_OBJECT('fecha_inicio', OLD.fecha_inicio, 'fecha_fin', OLD.fecha_fin,
+                                       'monto', OLD.monto, 'notas', OLD.notas),
+                  'despues', JSON_OBJECT('fecha_inicio', NEW.fecha_inicio, 'fecha_fin', NEW.fecha_fin,
+                                         'monto', NEW.monto, 'notas', NEW.notas)));
+  END IF;
+END$$
+
+CREATE TRIGGER trg_presupuestos_ad AFTER DELETE ON presupuestos FOR EACH ROW
+BEGIN
+  CALL sp_registrar_log('presupuesto_baja', 'presupuesto', OLD.id, @ckl_usuario_id,
+    JSON_OBJECT('departamento', (SELECT nombre FROM departamentos WHERE id = OLD.departamento_id),
+                'fecha_inicio', OLD.fecha_inicio, 'fecha_fin', OLD.fecha_fin, 'monto', OLD.monto));
 END$$
 
 DELIMITER ;

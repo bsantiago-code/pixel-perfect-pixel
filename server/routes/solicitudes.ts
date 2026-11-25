@@ -27,7 +27,7 @@ solicitudesRouter.get("/solicitudes", async (req, res) => {
 solicitudesRouter.get("/autorizaciones", async (req, res) => {
   const sc = scopeSolicitudes(me(req), conVentana(req.query.ventana));
   const list = await rows<R>(
-    `SELECT a.* FROM autorizaciones a JOIN solicitudes s ON s.id = a.solicitud_id WHERE ${sc.sql} ORDER BY a.fecha, a.id`,
+    `SELECT a.* FROM autorizaciones a JOIN solicitudes s ON s.folio = a.solicitud_id WHERE ${sc.sql} ORDER BY a.fecha, FIELD(a.rol_autorizador, 'jefe_inmediato', 'finanzas')`,
     sc.params,
   );
   res.json(list.map(autorizacionOut));
@@ -36,7 +36,7 @@ solicitudesRouter.get("/autorizaciones", async (req, res) => {
 solicitudesRouter.get("/comprobantes", async (req, res) => {
   const sc = scopeSolicitudes(me(req), conVentana(req.query.ventana));
   const list = await rows<R>(
-    `SELECT c.* FROM comprobantes_gasto c JOIN solicitudes s ON s.id = c.solicitud_id WHERE ${sc.sql} ORDER BY s.created_at DESC, c.seq`,
+    `SELECT c.* FROM comprobantes_gasto c JOIN solicitudes s ON s.folio = c.solicitud_id WHERE ${sc.sql} ORDER BY s.created_at DESC, c.seq`,
     sc.params,
   );
   res.json(list.map(comprobanteOut));
@@ -68,7 +68,7 @@ solicitudesRouter.get("/solicitudes/:id", async (req, res) => {
   const vePresupuesto = !!(p.autorizar_lte5000 || p.autorizar_gt5000 || p.gestionar_presupuestos);
   const [destinos, aut, presupuesto] = await Promise.all([
     destinosDe([req.params.id]),
-    rows<R>("SELECT * FROM autorizaciones WHERE solicitud_id = ? ORDER BY fecha, id", [req.params.id]),
+    rows<R>("SELECT * FROM autorizaciones WHERE solicitud_id = ? ORDER BY fecha, FIELD(rol_autorizador, 'jefe_inmediato', 'finanzas')", [s.folio]),
     vePresupuesto ? presupuestoDeSolicitud(String(req.params.id)) : Promise.resolve(undefined),
   ]);
   res.json({
@@ -117,7 +117,7 @@ solicitudesRouter.post("/solicitudes/:id/autorizar", async (req, res) => {
   // debe confirmarlo explícitamente en el aviso; sin la confirmación no se autoriza (no se puede omitir).
   const manuales = await rows<R>(
     "SELECT id, hotel_nombre, estado FROM revisiones_monto WHERE solicitud_id = ? AND vigente = 1",
-    [req.params.id],
+    [sol.folio],
   );
   if (manuales.length && !confirmo_hotel_manual) {
     throw new HttpError(
@@ -150,7 +150,9 @@ solicitudesRouter.post("/solicitudes/:id/rechazar", async (req, res) => {
 solicitudesRouter.post("/solicitudes/:id/revertir", async (req, res) => {
   const { user } = me(req);
   // Un viaje ya compensado está cerrado: revertir sus autorizaciones dejaría la compensación sin sentido.
-  await exigirNoCompensado(String(req.params.id));
+  const s = await one<R>("SELECT folio FROM solicitudes WHERE id = ?", [req.params.id]);
+  if (!s) throw notFound("La solicitud no existe.");
+  await exigirNoCompensado(String(s.folio)); // compensaciones.solicitud_id guarda el folio
   await withConn(user.id, (c) => c.query("CALL sp_revertir_autorizaciones(?, ?)", [req.params.id, user.id]));
   res.json(solicitudOut((await one<R>("SELECT * FROM solicitudes WHERE id = ?", [req.params.id]))!));
 });

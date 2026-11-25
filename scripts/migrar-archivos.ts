@@ -23,7 +23,7 @@ const pendientes = await rows<{ id: string; archivo: string; folio: string; empr
   `SELECT f.id, f.archivo, s.folio, s.empresa, s.fecha
      FROM facturas f
      JOIN factura_archivos a ON a.factura_id = f.id
-     JOIN solicitudes s ON s.id = f.solicitud_id
+     JOIN solicitudes s ON s.folio = f.solicitud_id
     WHERE f.ruta IS NULL
     ORDER BY f.created_at, f.id ${limite ? `LIMIT ${limite}` : ""}`,
 );

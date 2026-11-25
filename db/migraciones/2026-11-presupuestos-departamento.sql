@@ -88,7 +88,7 @@ CREATE VIEW v_presupuestos AS
     LEFT JOIN (
       SELECT p2.id AS presupuesto_id, SUM(s.monto_total) AS ejercido, COUNT(*) AS folios,
              SUM((SELECT COALESCE(SUM(c.monto_comprobado), 0) FROM comprobantes_gasto c
-                   WHERE c.solicitud_id = s.id)) AS comprobado
+                   WHERE c.solicitud_id = s.folio)) AS comprobado
         FROM presupuestos p2
         JOIN solicitudes s ON s.departamento_id = p2.departamento_id
                           AND s.fecha BETWEEN p2.fecha_inicio AND p2.fecha_fin
@@ -104,10 +104,11 @@ CREATE VIEW v_presupuestos AS
        GROUP BY p3.id
     ) pa ON pa.presupuesto_id = p.id;
 
--- 6 y 7. Procedimientos y triggers (copias exactas de db/schema.sql).
+-- 6 y 7. Procedimientos y triggers (copias exactas de db/schema.sql; usan el FOLIO en las tablas hijas).
 DROP PROCEDURE IF EXISTS sp_autorizar_solicitud;
 DROP PROCEDURE IF EXISTS sp_validar_presupuesto;
 DROP TRIGGER IF EXISTS trg_usuarios_au;
+DROP TRIGGER IF EXISTS trg_autorizaciones_bi;
 DROP TRIGGER IF EXISTS trg_solicitudes_bi;
 DROP TRIGGER IF EXISTS trg_presupuestos_bi;
 DROP TRIGGER IF EXISTS trg_presupuestos_bu;
@@ -201,11 +202,17 @@ BEGIN
     SELECT COALESCE(JSON_UNQUOTE(valor) = 'true', 0) INTO v_bloquear
       FROM configuracion WHERE clave = 'bloquear_folio_monto_hotel';
     IF v_bloquear = 1 AND EXISTS (SELECT 1 FROM revisiones_monto
-                                   WHERE solicitud_id = p_solicitud_id AND vigente = 1
+                                   WHERE solicitud_id = v_folio AND vigente = 1
                                      AND estado IN ('pendiente', 'rechazado')) THEN
       SIGNAL SQLSTATE '45000'
         SET MESSAGE_TEXT = 'Bloqueado: el monto manual de hotel está pendiente o rechazado por Compras.';
     END IF;
+  END IF;
+
+  -- La llave de autorizaciones es (folio, usuario): una persona registra una sola decisión por solicitud.
+  IF EXISTS (SELECT 1 FROM autorizaciones WHERE solicitud_id = v_folio AND user_id = p_user_id) THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Ya registraste una decisión en esta solicitud; el siguiente paso lo debe dar otra persona.';
   END IF;
 
   -- Presupuesto del departamento: el folio aún está Abierto, así que no está contado en lo ejercido.
@@ -234,9 +241,9 @@ BEGIN
     END IF;
   END IF;
 
-  INSERT INTO autorizaciones (id, solicitud_id, rol_autorizador, user_id, status, fecha, nota)
-  VALUES (CONCAT('a_', SUBSTRING(REPLACE(UUID(), '-', ''), 1, 10)), p_solicitud_id,
-          IF(v_paso = 'jefe', 'jefe_inmediato', 'finanzas'), p_user_id, p_decision, CURDATE(),
+  INSERT INTO autorizaciones (solicitud_id, rol_autorizador, user_id, user_nombre, status, fecha, nota)
+  VALUES (v_folio, IF(v_paso = 'jefe', 'jefe_inmediato', 'finanzas'), p_user_id,
+          (SELECT nombre FROM usuarios WHERE id = p_user_id), p_decision, CURDATE(),
           COALESCE(IF(p_decision = 'rechazado', p_nota, ''), ''));
 
   IF p_decision = 'rechazado' THEN
@@ -290,10 +297,14 @@ BEGIN
   END IF;
 END$$
 
--- Usuarios: al asignarle departamento a quien no tenía, sus folios sin departamento pasan a ese departamento
+-- Usuarios: autorizaciones.user_nombre siempre es el nombre vigente del usuario (se propaga al renombrar).
+-- Al asignarle departamento a quien no tenía, sus folios sin departamento pasan a ese departamento
 -- (para que cuenten en su presupuesto). Un cambio de departamento NO mueve los folios ya registrados.
 CREATE TRIGGER trg_usuarios_au AFTER UPDATE ON usuarios FOR EACH ROW
 BEGIN
+  IF NOT (NEW.nombre <=> OLD.nombre) THEN
+    UPDATE autorizaciones SET user_nombre = NEW.nombre WHERE user_id = NEW.id;
+  END IF;
   IF OLD.departamento_id IS NULL AND NEW.departamento_id IS NOT NULL THEN
     UPDATE solicitudes SET departamento_id = NEW.departamento_id
      WHERE user_id = NEW.id AND departamento_id IS NULL;
@@ -304,6 +315,11 @@ BEGIN
                   'antes', (SELECT nombre FROM departamentos WHERE id = OLD.departamento_id),
                   'despues', (SELECT nombre FROM departamentos WHERE id = NEW.departamento_id)));
   END IF;
+END$$
+
+CREATE TRIGGER trg_autorizaciones_bi BEFORE INSERT ON autorizaciones FOR EACH ROW
+BEGIN
+  SET NEW.user_nombre = (SELECT nombre FROM usuarios WHERE id = NEW.user_id);
 END$$
 
 -- Solicitudes: el folio toma el departamento de su solicitante al crearse (y ya no cambia).
@@ -353,6 +369,7 @@ BEGIN
     JSON_OBJECT('departamento', (SELECT nombre FROM departamentos WHERE id = OLD.departamento_id),
                 'fecha_inicio', OLD.fecha_inicio, 'fecha_fin', OLD.fecha_fin, 'monto', OLD.monto));
 END$$
+
 DELIMITER ;
 
 -- 8. Parámetro del bloqueo (apagado por omisión).

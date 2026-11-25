@@ -42,7 +42,8 @@ Archivos sin trackear en git que **no son parte del proyecto** (ignorar, no comm
 
 Todo vive en **MySQL 8.4** (`portal_viaticos`, esquema en `db/schema.sql`) y se accede **solo** a través de la API Express (`/api`). No hay `localStorage`.
 
-- Tablas principales: `solicitudes`, `solicitud_destinos` (+ `destino_hoteles`, `destino_transportes`, `destino_vales`), `autorizaciones`, `comprobantes_gasto`, `facturas` + `factura_archivos` (LONGBLOB), `convenios`, `hoteles`, `sociedades`, `roles` (permisos en JSON), `usuarios`, `sesiones`, `configuracion` (clave/valor JSON), `revisiones_monto`, `correos`, `logs`, `reset_codes`, `prealtas`.
+- **En todas las tablas hijas `solicitud_id` guarda el folio (`#0040`), no el id interno**. Llaves: `autorizaciones` = `(solicitud_id, user_id)`; `comprobantes_gasto` = `(solicitud_id, concepto)`; `facturas` se liga al renglón con `(solicitud_id, concepto)`.
+- Tablas principales: `solicitudes`, `solicitud_destinos` (+ `destino_hoteles`, `destino_transportes`, `destino_vales`), `autorizaciones` (llave `(solicitud_id, user_id)`; `solicitud_id` guarda el **folio** `#0040`, no el id interno; `user_nombre` se sincroniza con `usuarios.nombre` por triggers), `comprobantes_gasto`, `facturas` + `factura_archivos` (LONGBLOB), `convenios`, `hoteles`, `sociedades`, `roles` (permisos en JSON), `usuarios`, `sesiones`, `configuracion` (clave/valor JSON), `revisiones_monto`, `correos`, `logs`, `reset_codes`, `prealtas`.
 - Las **reglas de negocio** están en SPs y triggers (autorizar, revertir, folio consecutivo, aplicar/revertir monto de facturas, estatus del renglón, bitácora, sincronización convenios → hoteles). La API los llama; no los dupliques en Node ni en el front.
 - Cambios de esquema o de datos demo: edita `db/schema.sql` y corre `npm run db:setup` (destructivo: borra y recrea todo).
 - **Ningún secreto se guarda en claro.** Contraseñas de usuarios y pre-altas: hash scrypt (los datos demo ya se siembran con hash; los valores en claro de abajo son solo para iniciar sesión). Contraseña SMTP: cifrada con AES-256-GCM usando `APP_SECRET` (en `.env.local`, fuera de la base; `npm run dev:all` la genera si falta y la API no arranca sin ella; si cambia hay que volver a capturar la contraseña SMTP). Códigos de recuperación: huella HMAC-SHA256. Al arrancar, la API convierte cualquier valor antiguo en claro (`server/seguridad.ts`). La API nunca devuelve la contraseña SMTP al navegador.
@@ -53,7 +54,7 @@ Todo vive en **MySQL 8.4** (`portal_viaticos`, esquema en `db/schema.sql`) y se 
 - `Solicitud`: `folio` (`#0041`…, lo asigna `sp_siguiente_folio` **al guardar**, no al abrir el formulario), `jefe_status` (`Pendiente|Autorizado|Rechazado`), `finanzas_status` (`Pendiente|Autorizado|Rechazado|N/A`), `estatus` (`Abierto|Cerrado|Rechazado`), `monto_total`, `empresa` (nombre de sociedad), `created_at` ISO.
 - Destinos (`solicitud_destinos` y tablas hijas, ligados por `solicitud_id`): `estado`, fechas, `hoteles[]` (estancias con `monto` = **tarifa por noche**, `manual`, `hotel_id`), `foraneo[]`, `local[]`, `otros[]`.
 - `ComprobanteGasto`: un renglón por concepto de cada solicitud (`monto_solicitado`, `monto_comprobado`, `status_renglon`).
-- `Factura` (tipo local en `comprobacion.tsx`): archivo cargado, ligado a un `concepto_id` y `monto_aplicado` (permite revertir exacto al eliminar).
+- `Factura` (tipo en `store.ts`): archivo cargado, ligado al renglón `(solicitud_id = folio, concepto)` y con `monto_aplicado` (permite revertir exacto al eliminar).
 
 ## 4. Roles, permisos y usuarios demo
 

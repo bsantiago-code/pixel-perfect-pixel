@@ -37,7 +37,8 @@ DROP PROCEDURE IF EXISTS sp_dar_baja_convenio;
 DROP PROCEDURE IF EXISTS sp_reactivar_convenio;
 DROP PROCEDURE IF EXISTS sp_gasto_por_concepto;
 
-DROP TABLE IF EXISTS compensaciones, logs, correos, revisiones_monto, convenios, factura_archivos, facturas,
+DROP TABLE IF EXISTS compensaciones, logs, correos, revisiones_monto, convenios, deposito_archivos, depositos_sobrante,
+  factura_archivos, facturas,
   comprobantes_gasto, notas, autorizaciones, destino_vales, destino_transportes, destino_hoteles,
   solicitud_destinos, solicitudes, sesiones, reset_codes, prealtas, usuarios, folio_contador,
   configuracion, estados_mx, origenes, hoteles, sociedades, roles;
@@ -114,6 +115,7 @@ CREATE TABLE usuarios (
   empresa   VARCHAR(120) NOT NULL,
   jefe_id   VARCHAR(40)  NULL,
   activo    TINYINT(1)   NOT NULL DEFAULT 1,
+  autorizado_viajar TINYINT(1) NOT NULL DEFAULT 1 COMMENT '0 = "No Autorizado para Viajar" (pre-registro): no puede crear solicitudes hasta que su jefe inmediato lo habilite',
   initials  VARCHAR(4)   NOT NULL DEFAULT '',
   PRIMARY KEY (id),
   UNIQUE KEY uq_usuarios_correo (correo),
@@ -133,7 +135,8 @@ CREATE TABLE prealtas (
   clabe       VARCHAR(18)  NULL,
   sociedad    VARCHAR(120) NULL,
   password    VARCHAR(255) NOT NULL COMMENT 'Hash scrypt (scrypt$salt$hash); nunca en claro',
-  status      VARCHAR(20)  NOT NULL DEFAULT 'pendiente',
+  status      VARCHAR(20)  NOT NULL DEFAULT 'pendiente' COMMENT 'acceso_otorgado: la cuenta se crea al pre-registrarse',
+  usuario_id  VARCHAR(40)  NULL COMMENT 'Cuenta creada con este pre-registro',
   created_at  DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   PRIMARY KEY (id),
   KEY ix_prealtas_status (status)
@@ -315,6 +318,29 @@ CREATE TABLE factura_archivos (
   PRIMARY KEY (factura_id),
   CONSTRAINT fk_farch_factura FOREIGN KEY (factura_id) REFERENCES facturas (id) ON DELETE CASCADE
 ) ENGINE=InnoDB COMMENT='Contenido en BD (solo con STORAGE_DRIVER=db o sin migrar); con Drive/carpeta local no hay fila aquí';
+
+-- Depósito sobrante: fichas de depósito del sobrante de viáticos. Suman al comprobado del folio (aún sin SAP).
+CREATE TABLE depositos_sobrante (
+  id            VARCHAR(40)   NOT NULL,
+  solicitud_id  VARCHAR(40)   NOT NULL,
+  monto         DECIMAL(12,2) NOT NULL,
+  archivo       VARCHAR(255)  NOT NULL,
+  ruta          VARCHAR(500)  NULL COMMENT 'Archivo en almacenamiento externo: drive:<fileId> o local:<ruta>. NULL = el contenido está en deposito_archivos',
+  creado_por    VARCHAR(40)   NULL,
+  created_at    DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (id),
+  KEY ix_depositos_solicitud (solicitud_id),
+  CONSTRAINT fk_dep_solicitud FOREIGN KEY (solicitud_id) REFERENCES solicitudes (id) ON DELETE CASCADE,
+  CONSTRAINT fk_dep_usuario   FOREIGN KEY (creado_por)   REFERENCES usuarios (id)    ON DELETE SET NULL
+) ENGINE=InnoDB COMMENT='Fichas de depósito del sobrante de viáticos; suman al comprobado del folio';
+
+CREATE TABLE deposito_archivos (
+  deposito_id VARCHAR(40)  NOT NULL,
+  mime        VARCHAR(100) NOT NULL,
+  contenido   LONGBLOB     NOT NULL,
+  PRIMARY KEY (deposito_id),
+  CONSTRAINT fk_darch_deposito FOREIGN KEY (deposito_id) REFERENCES depositos_sobrante (id) ON DELETE CASCADE
+) ENGINE=InnoDB COMMENT='Contenido en BD (solo con STORAGE_DRIVER=db); con Drive/carpeta local no hay fila aquí';
 
 -- Compras Corporativas: convenios y revisiones ---------------------------
 CREATE TABLE convenios (
@@ -1253,24 +1279,29 @@ BEGIN
   COMMIT;
 END$$
 
--- Equivale a avanceComprobacion(): p_solo_avion = 1 limita el cálculo al concepto "Avión" (gestor de vuelos).
+-- Equivale a avanceComprobacion(): p_solo_avion = 1 limita el cálculo al concepto "Avión" (gestor de vuelos);
+-- los depósitos sobrantes del folio suman al comprobado (no aplican con p_solo_avion).
 CREATE PROCEDURE sp_recalcular_comprobacion(IN p_solicitud_id VARCHAR(40), IN p_solo_avion TINYINT(1))
 BEGIN
+  DECLARE v_dep DECIMAL(12,2) DEFAULT 0;
+  IF p_solo_avion = 0 THEN
+    SELECT COALESCE(SUM(monto), 0) INTO v_dep FROM depositos_sobrante WHERE solicitud_id = p_solicitud_id;
+  END IF;
   SELECT p_solicitud_id AS solicitud_id,
          COALESCE(SUM(monto_solicitado), 0) AS solicitado,
-         COALESCE(SUM(monto_comprobado), 0) AS comprobado,
+         COALESCE(SUM(monto_comprobado), 0) + v_dep AS comprobado,
          (COALESCE(SUM(monto_solicitado), 0) > 0
-            AND COALESCE(SUM(monto_comprobado), 0) = COALESCE(SUM(monto_solicitado), 0)) AS completo,
+            AND COALESCE(SUM(monto_comprobado), 0) + v_dep = COALESCE(SUM(monto_solicitado), 0)) AS completo,
          CASE WHEN COALESCE(SUM(monto_solicitado), 0) > 0
-              THEN LEAST(100, ROUND(SUM(monto_comprobado) / SUM(monto_solicitado) * 100))
+              THEN LEAST(100, ROUND((SUM(monto_comprobado) + v_dep) / SUM(monto_solicitado) * 100))
               ELSE 0 END AS pct
     FROM comprobantes_gasto
    WHERE solicitud_id = p_solicitud_id
      AND (p_solo_avion = 0 OR concepto = 'Avión');
 END$$
 
--- Folios Cerrado del usuario sin comprobar por completo. Si hay 2 o más (MAX_FOLIOS_SIN_COMPROBAR)
--- no puede generar una nueva solicitud: bloquea_nueva_solicitud = 1.
+-- Folios Cerrado del usuario sin comprobar por completo (depósitos sobrantes incluidos en lo comprobado). Si hay
+-- 2 o más (MAX_FOLIOS_SIN_COMPROBAR) no puede generar una nueva solicitud: bloquea_nueva_solicitud = 1.
 CREATE PROCEDURE sp_folios_sin_comprobar(IN p_user_id VARCHAR(40))
 BEGIN
   SELECT t.id, t.folio, t.monto_total, t.solicitado, t.comprobado,
@@ -1278,7 +1309,8 @@ BEGIN
     FROM (
       SELECT s.id, s.folio, s.monto_total,
              COALESCE(SUM(c.monto_solicitado), 0) AS solicitado,
-             COALESCE(SUM(c.monto_comprobado), 0) AS comprobado
+             COALESCE(SUM(c.monto_comprobado), 0)
+               + COALESCE((SELECT SUM(d.monto) FROM depositos_sobrante d WHERE d.solicitud_id = s.id), 0) AS comprobado
         FROM solicitudes s
         LEFT JOIN comprobantes_gasto c ON c.solicitud_id = s.id
        WHERE s.user_id = p_user_id AND s.estatus = 'Cerrado'

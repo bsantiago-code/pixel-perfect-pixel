@@ -8,6 +8,7 @@ import type {
   Autorizacion,
   Compensacion,
   ComprobanteGasto,
+  Deposito,
   ResumenCompensacion,
   Convenio,
   CorreoSimulado,
@@ -176,6 +177,13 @@ export const useAutorizaciones = (ventana = true) =>
 
 export const useComprobantes = (ventana = true) =>
   useQuery({ queryKey: ["comprobantes", ventana], queryFn: () => api.get<ComprobanteGasto[]>(`/comprobantes${q(ventana)}`) });
+
+// Fichas de depósito sobrante del alcance del usuario (suman al comprobado del folio en avanceComprobacion).
+export const useDepositos = (ventana = true) =>
+  useQuery({
+    queryKey: ["depositos", ventana],
+    queryFn: () => api.get<Deposito[]>(`/comprobacion/depositos${q(ventana)}`),
+  });
 
 export const useDestinos = (ventana = true, enabled = true) =>
   useQuery({ queryKey: ["destinos", ventana], queryFn: () => api.get<DestinoApi[]>(`/destinos${q(ventana)}`), enabled });

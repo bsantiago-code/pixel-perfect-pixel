@@ -100,6 +100,14 @@ export function CompensarViajeDialog({
                     </td>
                   </tr>
                 ))}
+                {r.depositos > 0 && (
+                  <tr className="border-t">
+                    <td className="p-2">Depósito sobrante</td>
+                    <td className="p-2 text-right">—</td>
+                    <td className="p-2 text-right">{fmtTarifa(r.depositos)}</td>
+                    <td className="p-2 text-right">—</td>
+                  </tr>
+                )}
                 <tr className="border-t-2 bg-secondary font-semibold">
                   <td className="p-2">Total</td>
                   <td className="p-2 text-right">{fmtTarifa(r.solicitado)}</td>

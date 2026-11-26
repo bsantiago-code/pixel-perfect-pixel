@@ -89,6 +89,20 @@ export function facturaOut(r: R) {
   };
 }
 
+/** Ficha de depósito sobrante sin contenido; el archivo se pide aparte en GET /api/comprobacion/depositos/:id/archivo. */
+export function depositoOut(r: R) {
+  return {
+    id: r.id,
+    solicitud_id: r.solicitud_id,
+    monto: r.monto,
+    archivo: r.archivo,
+    fecha: iso(r.created_at),
+    creado_por: r.creado_por ?? null,
+    creado_por_nombre: r.creado_por_nombre ?? null,
+    url: `/api/comprobacion/depositos/${encodeURIComponent(String(r.id))}/archivo`,
+  };
+}
+
 export function convenioOut(r: R) {
   const out: R = {
     id: r.id,

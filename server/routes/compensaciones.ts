@@ -78,14 +78,21 @@ export async function resumenCompensacion(solicitudId: string, db?: Db) {
     });
   const suma = (k: "solicitado" | "comprobado" | "facturado" | "excedente") =>
     redondear(conceptos.reduce((a, c) => a + c[k], 0));
+  // Depósito sobrante: tabla aparte; suma al comprobado del folio (no a un concepto).
+  const dep = await one<R>("SELECT COALESCE(SUM(monto), 0) AS total FROM depositos_sobrante WHERE solicitud_id = ?", [solicitudId], db);
+  const depositos = redondear(n(dep?.total));
+  const comprobadoTotal = redondear(suma("comprobado") + depositos);
   return {
     conceptos,
     solicitado: suma("solicitado"),
-    comprobado: suma("comprobado"),
+    comprobado: comprobadoTotal,
+    depositos,
     facturado: suma("facturado"),
     excedente: suma("excedente"),
     // Mismo criterio que avanceComprobacion / avanceValidacion del front.
-    comprobadoCompleto: conceptos.length > 0 && conceptos.every((c) => c.comprobado >= c.solicitado),
+    comprobadoCompleto:
+      conceptos.length > 0 &&
+      (conceptos.every((c) => c.comprobado >= c.solicitado) || comprobadoTotal >= suma("solicitado")),
     validadoCompleto: conceptos.length > 0 && conceptos.every((c) => c.validado),
   };
 }

@@ -3,7 +3,11 @@ import multer from "multer";
 import { z } from "zod";
 
 import { conceptoRequierePar } from "../../src/lib/store.ts";
-import { extraerUuidCfdi, validarContenidoFactura } from "../../src/lib/validar-factura.ts";
+import {
+  extraerUuidCfdi,
+  validarContenidoFactura,
+  validarFechaFactura,
+} from "../../src/lib/validar-factura.ts";
 import { me, requireAuth, requirePerm } from "../auth.ts";
 import { exec, newId, one, rows, tx } from "../db.ts";
 import { bad, forbidden, HttpError, notFound } from "../http.ts";
@@ -165,6 +169,9 @@ comprobacionRouter.post(
       } else if (rfcMatch && soc && String(rfcMatch[1]).toUpperCase() !== String(soc.rfc).toUpperCase()) {
         throw bad(`El RFC del receptor del XML no coincide con la sociedad (${soc.rfc}). No se guardó el comprobante.`);
       }
+      // Antigüedad: solo facturas emitidas en el mes en curso o en el anterior (hora de México).
+      const fecha = validarFechaFactura(text);
+      if (!fecha.ok) throw bad(fecha.motivo);
       // Duplicidad: el mismo CFDI (mismo UUID del timbre) no se acepta dos veces en todo el portal, aunque se
       // renombre el archivo o se suba en otra solicitud. Un XML sin timbre no es una factura válida ante el SAT.
       const leidoUuid = extraerUuidCfdi(text);

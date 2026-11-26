@@ -92,6 +92,64 @@ export function extraerUuidCfdi(xmlText: string): string | null {
   return null;
 }
 
+// ───────── fecha de emisión ─────────
+/** Zona horaria con la que se decide cuál es el "mes en curso" (no depende de la del servidor). */
+export const ZONA_HORARIA_FACTURAS = "America/Mexico_City";
+
+const MESES = [
+  "enero", "febrero", "marzo", "abril", "mayo", "junio",
+  "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+];
+
+/** Año y mes (1-12) de la fecha de emisión del CFDI (atributo `Fecha` del Comprobante), o null si no viene. */
+export function extraerFechaCfdi(xmlText: string): { anio: number; mes: number } | null {
+  let doc: Nodo;
+  try {
+    doc = parser.parse(xmlText) as Nodo;
+  } catch {
+    return null;
+  }
+  const comprobante = (doc.Comprobante ?? {}) as Nodo;
+  // Formato del SAT: AAAA-MM-DDThh:mm:ss (hora local del emisor, sin zona).
+  const m = /^(\d{4})-(\d{2})-\d{2}/.exec(String(comprobante["@_Fecha"] ?? "").trim());
+  if (!m) return null;
+  const anio = Number(m[1]);
+  const mes = Number(m[2]);
+  return mes >= 1 && mes <= 12 ? { anio, mes } : null;
+}
+
+/** Año y mes (1-12) de `hoy` en la hora de México. */
+function mesActualMexico(hoy: Date): { anio: number; mes: number } {
+  const partes = new Intl.DateTimeFormat("en-CA", {
+    timeZone: ZONA_HORARIA_FACTURAS,
+    year: "numeric",
+    month: "2-digit",
+  }).formatToParts(hoy);
+  const val = (t: string) => Number(partes.find((p) => p.type === t)?.value);
+  return { anio: val("year"), mes: val("month") };
+}
+
+/**
+ * Solo se aceptan facturas emitidas en el mes en curso o en el mes anterior (en noviembre: noviembre y octubre;
+ * en enero: enero y diciembre del año pasado). Una fecha de un mes posterior tampoco se acepta.
+ */
+export function validarFechaFactura(xmlText: string, hoy: Date = new Date()): ResultadoFactura {
+  const f = extraerFechaCfdi(xmlText);
+  if (!f) {
+    return { ok: false, motivo: "El XML no trae la fecha de emisión de la factura. No se guardó el comprobante." };
+  }
+  const actual = mesActualMexico(hoy);
+  const indice = (x: { anio: number; mes: number }) => x.anio * 12 + (x.mes - 1);
+  const diferencia = indice(actual) - indice(f);
+  if (diferencia === 0 || diferencia === 1) return { ok: true };
+  const anterior = actual.mes === 1 ? { anio: actual.anio - 1, mes: 12 } : { anio: actual.anio, mes: actual.mes - 1 };
+  const nombre = (x: { anio: number; mes: number }) => `${MESES[x.mes - 1]} ${x.anio}`;
+  return {
+    ok: false,
+    motivo: `La factura es de ${nombre(f)}. Solo se aceptan facturas del mes en curso (${nombre(actual)}) o del mes anterior (${nombre(anterior)}). No se guardó el comprobante.`,
+  };
+}
+
 // ───────── coincidencia de palabras ─────────
 const escapar = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 

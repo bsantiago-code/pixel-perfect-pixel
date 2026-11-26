@@ -295,7 +295,9 @@ CREATE TABLE facturas (
   monto_aplicado  DECIMAL(12,2) NOT NULL DEFAULT 0 COMMENT 'Solo el XML aplica monto; permite revertir exacto',
   par_id          VARCHAR(80)   NULL COMMENT 'Comparten par_id el XML y el PDF de un mismo comprobante',
   ruta            VARCHAR(500)  NULL COMMENT 'Archivo en almacenamiento externo: drive:<fileId> o local:<ruta>. NULL = el contenido está en factura_archivos',
-  created_at      DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  sat_estado      VARCHAR(20)   NULL COMMENT 'Estado del CFDI ante el SAT al subirlo (XML): Vigente | Pendiente (SAT sin respuesta) | NULL (no consultado)',
+  sat_verificado_en DATETIME    NULL COMMENT 'Cuándo se consultó al SAT',
+  created_at     DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   uuid_xml        VARCHAR(60)   GENERATED ALWAYS AS (IF(tipo = 'XML' AND uuid <> '', uuid, NULL)) VIRTUAL
                   COMMENT 'UUID fiscal solo en los XML: el índice único impide comprobar dos veces la misma factura',
   PRIMARY KEY (id),
@@ -546,6 +548,7 @@ INSERT INTO configuracion (clave, valor) VALUES
   ('notif_plataforma_activo', 'true'),
   ('revision_automatica_activo', 'true'),
   ('bloquear_folio_monto_hotel', 'false'),
+  ('sat_validacion_activa', 'true'),
   -- Palabras que rechazan una factura al subirla (Configuración → Productos no permitidos en facturas).
   ('palabras_prohibidas_alcohol', '["cerveza","vino","tequila","mezcal","whisky","whiskey","ron","vodka","ginebra","brandy","coñac","cognac","licor","sidra","champagne","champaña","aguardiente","bacardi","destilado"]'),
   ('palabras_prohibidas_tabaco', '["cigarro","cigarrillo","cigarrillos","vape","vapeador","tabaco","puro","nicotina","habano"]'),

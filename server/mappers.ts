@@ -84,6 +84,7 @@ export function facturaOut(r: R) {
     concepto_id: r.concepto_id ?? null,
     monto_aplicado: r.monto_aplicado,
     par_id: r.par_id ?? undefined,
+    sat_estado: r.sat_estado ?? null,
     url: `/api/facturas/${encodeURIComponent(String(r.id))}/archivo`,
   };
 }

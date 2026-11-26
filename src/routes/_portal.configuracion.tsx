@@ -347,6 +347,29 @@ function Configuracion() {
               />
             </button>
           </div>
+          <div className="flex items-center justify-between gap-4 rounded-lg border p-3">
+            <div>
+              <div className="text-sm font-semibold">Verificar facturas con el SAT</div>
+              <div className="text-xs text-muted-foreground">
+                Al subir un XML se consulta al SAT y se rechaza el CFDI cancelado o no encontrado. Si el SAT
+                no responde, la factura se acepta y queda como pendiente de verificar.
+              </div>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={draft.sat_validacion_activa !== false}
+              aria-label="Verificar facturas con el SAT"
+              onClick={() => setDraft({ ...draft, sat_validacion_activa: draft.sat_validacion_activa === false })}
+              className="relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors"
+              style={{ background: draft.sat_validacion_activa !== false ? "var(--color-primary)" : "#ccc" }}
+            >
+              <span
+                className="inline-block h-4 w-4 transform rounded-full bg-white transition-transform"
+                style={{ transform: draft.sat_validacion_activa !== false ? "translateX(18px)" : "translateX(2px)" }}
+              />
+            </button>
+          </div>
         </div>
         <button onClick={saveCfg} className="ckl-btn-primary mt-4">Guardar</button>
       </div>

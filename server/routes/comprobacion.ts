@@ -3,14 +3,15 @@ import multer from "multer";
 import { z } from "zod";
 
 import { conceptoRequierePar } from "../../src/lib/store.ts";
-import { extraerUuidCfdi, validarContenidoFactura } from "../../src/lib/validar-factura.ts";
+import { extraerDatosCfdi, extraerUuidCfdi, validarContenidoFactura } from "../../src/lib/validar-factura.ts";
 import { me, requireAuth, requirePerm } from "../auth.ts";
 import { exec, newId, one, rows, tx } from "../db.ts";
 import { bad, forbidden, HttpError, notFound } from "../http.ts";
 import { comprobanteOut, facturaOut } from "../mappers.ts";
+import { consultarEstadoCfdi } from "../services/sat.ts";
 import { exigirAlcance } from "../services/solicitudes.ts";
 import { almacenActivo, almacenDeRef, AlmacenError, mimePorNombre, type Almacen } from "../storage/index.ts";
-import { cargarListasProhibidas } from "./admin.ts";
+import { cargarListasProhibidas, loadConfig } from "./admin.ts";
 import { exigirNoCompensado } from "./compensaciones.ts";
 
 export const comprobacionRouter = Router();
@@ -142,6 +143,7 @@ comprobacionRouter.post(
 
     // UUID fiscal del timbre del SAT (solo comprobantes con XML; los Vales no tienen folio fiscal).
     let uuid = "";
+    let satEstado: string | null = null; // resultado de la consulta al SAT (null = no se consultó)
     // Monto del comprobante: el Total del XML (obligatorio). Los Vales aún no piden el importe al usuario y
     // conservan el monto simulado del prototipo (200–999): PENDIENTE de definir cómo capturarlo.
     let total = Math.floor(Math.random() * 800) + 200;
@@ -179,6 +181,23 @@ comprobacionRouter.post(
       // Antes se inventaba un monto si faltaba el Total; ahora se rechaza (todo CFDI válido lo trae).
       if (!(leido > 0)) throw bad("El XML no trae el Total de la factura. No se guardó el comprobante.");
       total = leido;
+
+      // Vigencia ante el SAT (interruptor en Configuración). Si el SAT no responde queda 'Pendiente' y se acepta.
+      const cfg = await loadConfig();
+      const datos = cfg.sat_validacion_activa === false ? null : extraerDatosCfdi(text);
+      if (datos) {
+        const sat = await consultarEstadoCfdi({ ...datos, uuid });
+        satEstado = sat.estado;
+        if (sat.estado === "Cancelado") {
+          throw new HttpError(409, "El CFDI está cancelado ante el SAT y no puede comprobarse. No se guardó el comprobante.");
+        }
+        if (sat.estado === "No Encontrado") {
+          throw new HttpError(
+            409,
+            "El SAT no encontró este CFDI (RFC, total o UUID no coinciden, o fue timbrado hace pocos minutos). Verifica el XML o intenta de nuevo más tarde. No se guardó el comprobante.",
+          );
+        }
+      }
     }
 
     // Con almacenamiento externo (Drive/carpeta) los archivos se suben antes de la transacción y la BD solo guarda
@@ -240,9 +259,13 @@ comprobacionRouter.post(
       const insertar = async (f: Express.Multer.File, tipo: string, montoAplicado: number) => {
         const id = newId("f_");
         await exec(
-          `INSERT INTO facturas (id, solicitud_id, tipo, fecha, uuid, archivo, total, status, concepto_id, monto_aplicado, par_id, ruta)
-           VALUES (?, ?, ?, CURDATE(), ?, ?, ?, 'Verificado', ?, ?, ?, ?)`,
-          [id, reng.solicitud_id, tipo, uuid, f.originalname, total, reng.id, montoAplicado, parId, refs.get(f) ?? null],
+          `INSERT INTO facturas (id, solicitud_id, tipo, fecha, uuid, archivo, total, status, concepto_id, monto_aplicado, par_id, ruta, sat_estado, sat_verificado_en)
+           VALUES (?, ?, ?, CURDATE(), ?, ?, ?, 'Verificado', ?, ?, ?, ?, ?, ?)`,
+          [
+            id, reng.solicitud_id, tipo, uuid, f.originalname, total, reng.id, montoAplicado, parId, refs.get(f) ?? null,
+            tipo === "XML" ? satEstado : null,
+            tipo === "XML" && satEstado ? new Date() : null,
+          ],
           c,
         );
         // Solo en modo BD el contenido va en factura_archivos; con almacén externo no se duplica.
@@ -270,6 +293,48 @@ comprobacionRouter.post(
     res.status(201).json({ renglon: comprobanteOut(r!), uuid, total, excedente });
   },
 );
+
+// ───────── reverificar con el SAT un comprobante que quedó "Pendiente" (sin volver a subirlo) ─────────
+// Vigente → queda verificado. Cancelado / No Encontrado → mismo criterio que al subir: se quita el comprobante
+// (el trigger revierte el monto) para que el usuario cargue uno válido. SAT sin respuesta → sigue Pendiente.
+comprobacionRouter.post("/comprobacion/facturas/:key/verificar-sat", requirePerm("comprobar"), async (req, res) => {
+  const auth = me(req);
+  const items = await rows<R>(
+    `SELECT f.id, f.solicitud_id, f.tipo, f.uuid, f.ruta, f.sat_estado, a.contenido
+       FROM facturas f LEFT JOIN factura_archivos a ON a.factura_id = f.id
+      WHERE f.par_id = ? OR f.id = ?`,
+    [req.params.key, req.params.key],
+  );
+  if (!items.length) throw notFound("El comprobante no existe.");
+  await exigirAlcance(auth, String(items[0].solicitud_id));
+  await exigirNoCompensado(String(items[0].solicitud_id));
+  const xml = items.find((i) => i.tipo === "XML");
+  if (!xml) throw bad("Este comprobante no tiene XML que verificar.");
+  if (xml.sat_estado !== "Pendiente") throw new HttpError(409, "Este comprobante no está pendiente de verificación con el SAT.");
+
+  let texto: string;
+  try {
+    texto = xml.ruta
+      ? (await almacenDeRef(String(xml.ruta)).leer(String(xml.ruta))).buffer.toString("utf8")
+      : (xml.contenido as Buffer).toString("utf8");
+  } catch (e) {
+    throw aHttp(e);
+  }
+  const datos = extraerDatosCfdi(texto);
+  if (!datos) throw bad("No se pudo leer el XML guardado para verificarlo.");
+
+  const sat = await consultarEstadoCfdi({ ...datos, uuid: String(xml.uuid) });
+  if (sat.estado === "Pendiente") {
+    return res.json({ estado: "Pendiente", eliminado: false });
+  }
+  if (sat.estado === "Vigente") {
+    await exec("UPDATE facturas SET sat_estado = 'Vigente', sat_verificado_en = NOW() WHERE id = ?", [xml.id]);
+    return res.json({ estado: "Vigente", eliminado: false });
+  }
+  await tx((c) => exec("DELETE FROM facturas WHERE par_id = ? OR id = ?", [req.params.key, req.params.key], c), auth.user.id);
+  await quitarArchivos(items.map((i) => i.ruta).filter((r): r is string => typeof r === "string" && r !== ""));
+  res.json({ estado: sat.estado, eliminado: true });
+});
 
 // ───────── eliminar comprobante completo (par o archivo suelto); el trigger revierte el monto ─────────
 comprobacionRouter.delete("/comprobacion/facturas/:key", requirePerm("comprobar"), async (req, res) => {

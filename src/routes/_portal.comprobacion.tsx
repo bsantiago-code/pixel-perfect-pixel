@@ -10,6 +10,7 @@ import {
   Search,
   ChevronDown,
   CheckCircle2,
+  RefreshCw,
 } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "@/lib/auth";
@@ -245,6 +246,28 @@ function Comprobacion() {
   );
   const removeGrupo = (g: Factura[]) => eliminarMut.mutate(g);
 
+  // Reverifica con el SAT un comprobante que quedó "SAT pendiente" (sin volver a subir los archivos).
+  const verificarSatMut = useApiMutation(
+    (g: Factura[]) =>
+      api.post<{ estado: string; eliminado: boolean }>(
+        `/comprobacion/facturas/${g[0].par_id ?? g[0].id}/verificar-sat`,
+      ),
+    {
+      onSuccess: (r) => {
+        if (r.estado === "Vigente") toast.success("El SAT confirmó que la factura está vigente.");
+        else if (r.eliminado)
+          showErrorDialog(
+            r.estado === "Cancelado"
+              ? "El CFDI está cancelado ante el SAT. Se quitó el comprobante; carga una factura vigente."
+              : "El SAT no encontró este CFDI. Se quitó el comprobante; verifica el XML y vuelve a cargarlo.",
+          );
+        else toast.info("El SAT sigue sin responder. Intenta verificar de nuevo más tarde.");
+      },
+    },
+  );
+  const verificarSat = (g: Factura[]) => verificarSatMut.mutate(g);
+  const satPendiente = (g: Factura[]) => g.some((f) => f.sat_estado === "Pendiente");
+
   if (!sel && cargandoSol)
     return (
       <div className="ckl-card p-8 text-center text-sm text-muted-foreground">Cargando…</div>
@@ -380,6 +403,7 @@ function Comprobacion() {
       return { texto: `Incompleto · falta ${falta}`, bg: "#FEF3C7", fg: "#B45309" };
     }
     if (g.some((f) => f.status === "Error")) return { texto: "Error", bg: "#FEE9EA", fg: "#E30613" };
+    if (g.some((f) => f.sat_estado === "Pendiente")) return { texto: "SAT pendiente", bg: "#FEF3C7", fg: "#B45309" };
     return { texto: "Verificado", bg: "#D8F3DC", fg: "#2D6A4F" };
   };
   const badgeRenglon = (r: ComprobanteGasto) => (
@@ -617,6 +641,17 @@ function Comprobacion() {
                   <span className="text-xs text-muted-foreground">
                     {f.fecha} · <b className="text-foreground">{fmtMoney(f.total)}</b>
                   </span>
+                  {puedeComprobar && !compensado && satPendiente(g) && (
+                    <button
+                      title="Verificar con SAT"
+                      aria-label="Verificar con SAT"
+                      disabled={verificarSatMut.isPending}
+                      className="rounded p-2 hover:bg-secondary disabled:opacity-50"
+                      onClick={() => verificarSat(g)}
+                    >
+                      <RefreshCw size={16} />
+                    </button>
+                  )}
                   {puedeComprobar && !compensado && (
                     <button title="Eliminar" aria-label="Eliminar comprobante" className="rounded p-2 hover:bg-secondary" onClick={() => removeGrupo(g)}>
                       <Trash2 size={16} />
@@ -692,6 +727,17 @@ function Comprobacion() {
                             </div>
                           ))}
                         </div>
+                        {puedeComprobar && !compensado && satPendiente(g) && (
+                          <button
+                            title="Verificar con SAT"
+                            aria-label="Verificar con SAT"
+                            disabled={verificarSatMut.isPending}
+                            className="rounded p-1 hover:bg-secondary disabled:opacity-50"
+                            onClick={() => verificarSat(g)}
+                          >
+                            <RefreshCw size={14} />
+                          </button>
+                        )}
                         {puedeComprobar && !compensado && (
                           <button
                             title="Eliminar"

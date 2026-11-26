@@ -99,7 +99,7 @@ const CONFIG_KEYS = new Set([
   "dias_comprobacion_atrasada", "dias_autorizacion_pendiente", "dias_recordatorio_viaje",
   "notif_email_activo", "notif_email_destinatarios", "smtp_servidor", "smtp_puerto", "smtp_usuario",
   "smtp_password", "smtp_cifrado", "smtp_remitente", "notif_plataforma_activo", "revision_automatica_activo",
-  "bloquear_folio_monto_hotel", ...Object.keys(LISTAS_KEYS),
+  "bloquear_folio_monto_hotel", "sat_validacion_activa", ...Object.keys(LISTAS_KEYS),
 ]);
 
 adminRouter.put("/config", requirePerm("configurar_montos"), async (req, res) => {

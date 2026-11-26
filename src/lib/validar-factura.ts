@@ -92,6 +92,24 @@ export function extraerUuidCfdi(xmlText: string): string | null {
   return null;
 }
 
+/** RFC de emisor y receptor y Total del CFDI (lo que pide la consulta de estado al SAT); null si no se puede leer. */
+export function extraerDatosCfdi(
+  xmlText: string,
+): { rfcEmisor: string; rfcReceptor: string; total: number } | null {
+  let doc: Nodo;
+  try {
+    doc = parser.parse(xmlText) as Nodo;
+  } catch {
+    return null;
+  }
+  const c = (doc.Comprobante ?? {}) as Nodo;
+  const rfcEmisor = String(((c.Emisor ?? {}) as Nodo)["@_Rfc"] ?? "").trim().toUpperCase();
+  const rfcReceptor = String(((c.Receptor ?? {}) as Nodo)["@_Rfc"] ?? "").trim().toUpperCase();
+  const total = Number(String(c["@_Total"] ?? "").replace(/,/g, ""));
+  if (!rfcEmisor || !rfcReceptor || !Number.isFinite(total)) return null;
+  return { rfcEmisor, rfcReceptor, total };
+}
+
 // ───────── coincidencia de palabras ─────────
 const escapar = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 

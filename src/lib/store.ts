@@ -470,6 +470,8 @@ export type Factura = {
   // El archivo vive en la BD; se abre con `url` (GET /api/facturas/:id/archivo).
   url?: string;
   par_id?: string;
+  // Estado ante el SAT al subir el XML; "Pendiente" = el SAT no respondió y falta reverificar.
+  sat_estado?: string | null;
 };
 
 export function conceptoRequierePar(concepto: string) {

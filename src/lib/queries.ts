@@ -55,6 +55,7 @@ export type Config = {
   notif_plataforma_activo: boolean;
   revision_automatica_activo: boolean;
   bloquear_folio_monto_hotel: boolean;
+  sat_validacion_activa: boolean;
   palabras_prohibidas_alcohol: string[];
   palabras_prohibidas_tabaco: string[];
   palabras_prohibidas_higiene: string[];
@@ -78,6 +79,7 @@ export const CONFIG_DEFAULTS: Config = {
   notif_plataforma_activo: true,
   revision_automatica_activo: true,
   bloquear_folio_monto_hotel: false,
+  sat_validacion_activa: true,
   palabras_prohibidas_alcohol: PALABRAS_DEFAULT.alcohol,
   palabras_prohibidas_tabaco: PALABRAS_DEFAULT.tabaco,
   palabras_prohibidas_higiene: PALABRAS_DEFAULT.higiene,

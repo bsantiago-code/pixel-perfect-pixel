@@ -3,11 +3,13 @@ import multer from "multer";
 import { z } from "zod";
 
 import { conceptoRequierePar } from "../../src/lib/store.ts";
+import { extraerDesgloseCfdi, type DesgloseCfdi } from "../../src/lib/desglose-cfdi.ts";
 import { extraerDatosCfdi, extraerUuidCfdi, validarContenidoFactura } from "../../src/lib/validar-factura.ts";
 import { me, requireAuth, requirePerm } from "../auth.ts";
 import { exec, newId, one, rows, tx } from "../db.ts";
 import { bad, forbidden, HttpError, notFound } from "../http.ts";
 import { comprobanteOut, depositoOut, facturaOut } from "../mappers.ts";
+import { guardarDesglose } from "../services/contabilidad.ts";
 import { consultarEstadoCfdi } from "../services/sat.ts";
 import { scopeSolicitudes } from "../scope.ts";
 import { exigirAlcance } from "../services/solicitudes.ts";
@@ -153,6 +155,7 @@ comprobacionRouter.post(
     // UUID fiscal del timbre del SAT (solo comprobantes con XML; los Vales no tienen folio fiscal).
     let uuid = "";
     let satEstado: string | null = null; // resultado de la consulta al SAT (null = no se consultó)
+    let desglose: DesgloseCfdi | null = null; // desglose contable del XML (insumo del asiento a SAP)
     // Monto del comprobante: el Total del XML (obligatorio). Los Vales aún no piden el importe al usuario y
     // conservan el monto simulado del prototipo (200–999): PENDIENTE de definir cómo capturarlo.
     let total = Math.floor(Math.random() * 800) + 200;
@@ -181,6 +184,7 @@ comprobacionRouter.post(
         throw bad("El XML no está timbrado ante el SAT (no trae el folio fiscal UUID). No se guardó el comprobante.");
       }
       uuid = leidoUuid;
+      desglose = extraerDesgloseCfdi(text);
       const previo = await xmlYaCargado(uuid);
       if (previo) throw new HttpError(409, mensajeDuplicado(uuid, previo));
       const v = validarContenidoFactura(text, await cargarListasProhibidas());
@@ -277,6 +281,7 @@ comprobacionRouter.post(
           ],
           c,
         );
+        if (tipo === "XML" && desglose) await guardarDesglose(id, desglose, c);
         // Solo en modo BD el contenido va en factura_archivos; con almacén externo no se duplica.
         if (!refs.has(f)) {
           await exec("INSERT INTO factura_archivos (factura_id, mime, contenido) VALUES (?, ?, ?)", [id, f.mimetype || "application/octet-stream", f.buffer], c);

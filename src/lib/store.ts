@@ -318,6 +318,7 @@ export type Compensacion = {
   comentario?: string;
   compensado_por: string;
   compensado_at: string; // ISO con hora
+  documento_sap?: string; // documento contable que confirmó SAP al compensar (si la contabilización estaba activa)
 };
 
 export type ResumenCompensacion = {

@@ -8,6 +8,7 @@ import {
 } from "../../src/lib/palabras-prohibidas.ts";
 import { hashPassword, me, requireAuth, requirePerm, toAuthUser } from "../auth.ts";
 import { exec, newId, one, rows, tx } from "../db.ts";
+import { CLAVES_CUENTAS } from "../../src/lib/sap.ts";
 import { bad, forbidden, HttpError, notFound } from "../http.ts";
 import { cifrarSecreto } from "../secretos.ts";
 import { almacenActivo, almacenDe, AlmacenError, driverConfigurado } from "../storage/index.ts";
@@ -94,12 +95,31 @@ export async function cargarListasProhibidas(): Promise<ListasProhibidas> {
   };
 }
 
+/** Cuentas contables de SAP: solo claves conocidas, texto corto (letras, números, . - _ /) y sin vacíos. */
+function normalizarCuentasSap(v: unknown): Record<string, string> {
+  if (!v || typeof v !== "object" || Array.isArray(v)) throw bad("Las cuentas contables deben ser un mapa de texto.");
+  const out: Record<string, string> = {};
+  for (const [k, raw] of Object.entries(v as Record<string, unknown>)) {
+    if (!CLAVES_CUENTAS.has(k)) continue;
+    if (raw === null || raw === undefined || raw === "") continue;
+    if (typeof raw !== "string") throw bad("Las cuentas contables deben ser texto.");
+    const cuenta = raw.trim();
+    if (!cuenta) continue;
+    if (!/^[A-Za-z0-9._\-/]{1,30}$/.test(cuenta)) {
+      throw bad(`La cuenta "${cuenta}" no es válida: usa hasta 30 letras, números, punto, guion o diagonal.`);
+    }
+    out[k] = cuenta;
+  }
+  return out;
+}
+
 const CONFIG_KEYS = new Set([
   "monto_comida_diario", "umbral_finanzas", "dia_deposito", "email_compras",
   "dias_comprobacion_atrasada", "dias_autorizacion_pendiente", "dias_recordatorio_viaje",
   "notif_email_activo", "notif_email_destinatarios", "smtp_servidor", "smtp_puerto", "smtp_usuario",
   "smtp_password", "smtp_cifrado", "smtp_remitente", "notif_plataforma_activo", "revision_automatica_activo",
-  "bloquear_folio_monto_hotel", "sat_validacion_activa", ...Object.keys(LISTAS_KEYS),
+  "bloquear_folio_monto_hotel", "sat_validacion_activa", "sap_contabilizacion_activa", "sap_modo", "sap_cuentas",
+  ...Object.keys(LISTAS_KEYS),
 ]);
 
 adminRouter.put("/config", requirePerm("configurar_montos"), async (req, res) => {
@@ -114,8 +134,12 @@ adminRouter.put("/config", requirePerm("configurar_montos"), async (req, res) =>
         if (typeof v !== "string") throw bad("La contraseña SMTP debe ser texto.");
         if (v === "") continue; // vacío = conservar la guardada
       }
+      if (k === "sap_contabilizacion_activa" && typeof v !== "boolean") throw bad("El interruptor de contabilización debe ser sí o no.");
+      if (k === "sap_modo" && v !== "simulado" && v !== "real") throw bad("El modo de SAP debe ser simulado o real.");
       const valor =
-        k in LISTAS_KEYS
+        k === "sap_cuentas"
+          ? normalizarCuentasSap(v)
+          : k in LISTAS_KEYS
           ? normalizarListaPalabras(v)
           : k === "smtp_remitente"
             ? limpiarNombre(v)
@@ -127,6 +151,14 @@ adminRouter.put("/config", requirePerm("configurar_montos"), async (req, res) =>
         [k, JSON.stringify(valor)],
         c,
       );
+    }
+    for (const k of ["sap_contabilizacion_activa", "sap_modo", "sap_cuentas"] as const) {
+      if (k in body && JSON.stringify(antes[k] ?? null) !== JSON.stringify(k === "sap_cuentas" ? normalizarCuentasSap(body[k]) : body[k])) {
+        await c.query("CALL sp_registrar_log(?, ?, ?, ?, ?)", [
+          "config_sap", "config", k, auth.user.id,
+          JSON.stringify({ antes: antes[k] ?? null, despues: k === "sap_cuentas" ? normalizarCuentasSap(body[k]) : body[k] }),
+        ]);
+      }
     }
     if (
       "bloquear_folio_monto_hotel" in body &&

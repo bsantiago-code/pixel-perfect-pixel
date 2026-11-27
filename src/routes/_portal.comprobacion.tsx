@@ -125,13 +125,14 @@ function Comprobacion() {
   );
   // Si el folio guardado ya no está en el alcance del usuario, cae al de por omisión.
   const sid = cerradas.some((c) => c.id === sidState) ? sidState : porDefecto;
-  // Si la URL trae (o cambia a) un solicitudId válido, ese folio queda seleccionado.
+  // Si la URL trae (o cambia a) un solicitudId válido, ese folio queda seleccionado. Depende de `cerradas` (no solo
+  // de las solicitudes) porque para Compras la lista también espera a comprobantes y depósitos: si el folio de la URL
+  // aún no aparece cuando llegan las solicitudes, se selecciona en cuanto la lista lo incluye.
   useEffect(() => {
     if (solicitudId && cerradas.some((c) => c.id === solicitudId)) {
       setSid(solicitudId);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [solicitudId, solicitudesData]);
+  }, [solicitudId, cerradas]);
   // Selección manual: actualiza el estado y refleja el folio en la URL (sin apilar historial).
   const selectFolio = (id: string) => {
     setSid(id);

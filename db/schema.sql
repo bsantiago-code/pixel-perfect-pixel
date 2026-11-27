@@ -37,7 +37,7 @@ DROP PROCEDURE IF EXISTS sp_dar_baja_convenio;
 DROP PROCEDURE IF EXISTS sp_reactivar_convenio;
 DROP PROCEDURE IF EXISTS sp_gasto_por_concepto;
 
-DROP TABLE IF EXISTS compensaciones, logs, correos, revisiones_monto, convenios, deposito_archivos, depositos_sobrante,
+DROP TABLE IF EXISTS contabilizaciones, factura_desglose, compensaciones, logs, correos, revisiones_monto, convenios, deposito_archivos, depositos_sobrante,
   factura_archivos, facturas,
   comprobantes_gasto, notas, autorizaciones, destino_vales, destino_transportes, destino_hoteles,
   solicitud_destinos, solicitudes, sesiones, reset_codes, prealtas, usuarios, folio_contador,
@@ -342,6 +342,41 @@ CREATE TABLE deposito_archivos (
   CONSTRAINT fk_darch_deposito FOREIGN KEY (deposito_id) REFERENCES depositos_sobrante (id) ON DELETE CASCADE
 ) ENGINE=InnoDB COMMENT='Contenido en BD (solo con STORAGE_DRIVER=db); con Drive/carpeta local no hay fila aquí';
 
+-- Contabilización a SAP al compensar el viaje (desglose del XML y envío por folio).
+CREATE TABLE factura_desglose (
+  factura_id   VARCHAR(40)   NOT NULL COMMENT 'Fila XML de facturas',
+  moneda       VARCHAR(3)    NOT NULL DEFAULT 'MXN',
+  tipo_cambio  DECIMAL(12,6) NULL,
+  subtotal     DECIMAL(14,2) NOT NULL DEFAULT 0,
+  descuento    DECIMAL(14,2) NOT NULL DEFAULT 0,
+  total        DECIMAL(14,2) NOT NULL DEFAULT 0,
+  detalle      JSON          NOT NULL COMMENT 'Conceptos con sus traslados y retenciones, y los impuestos del comprobante',
+  created_at   DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (factura_id),
+  CONSTRAINT fk_fdes_factura FOREIGN KEY (factura_id) REFERENCES facturas (id) ON DELETE CASCADE
+) ENGINE=InnoDB COMMENT='Desglose contable del CFDI (insumo del asiento a SAP)';
+
+CREATE TABLE contabilizaciones (
+  id             VARCHAR(40)  NOT NULL,
+  solicitud_id   VARCHAR(40)  NOT NULL,
+  referencia     VARCHAR(40)  NOT NULL COMMENT 'Folio como texto, sin "#": llave de idempotencia en SAP',
+  estado         ENUM('enviando','enviado','error','cancelada') NOT NULL DEFAULT 'enviando',
+  modo           VARCHAR(10)  NOT NULL DEFAULT 'simulado' COMMENT 'simulado | real',
+  payload        JSON         NOT NULL COMMENT 'Asiento enviado a SAP',
+  respuesta      JSON         NULL,
+  documento_sap  VARCHAR(60)  NULL COMMENT 'Número de documento contable que devolvió SAP',
+  error          TEXT         NULL,
+  intentos       INT          NOT NULL DEFAULT 0,
+  creado_por     VARCHAR(40)  NULL,
+  created_at     DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  enviado_at     DATETIME(3)  NULL,
+  updated_at     DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_contab_solicitud (solicitud_id),
+  CONSTRAINT fk_contab_solicitud FOREIGN KEY (solicitud_id) REFERENCES solicitudes (id) ON DELETE CASCADE,
+  CONSTRAINT fk_contab_usuario   FOREIGN KEY (creado_por)   REFERENCES usuarios (id)    ON DELETE SET NULL
+) ENGINE=InnoDB COMMENT='Envío a SAP del asiento de un viaje al compensarlo';
+
 -- Compras Corporativas: convenios y revisiones ---------------------------
 CREATE TABLE convenios (
   id               VARCHAR(40)   NOT NULL,
@@ -575,6 +610,10 @@ INSERT INTO configuracion (clave, valor) VALUES
   ('revision_automatica_activo', 'true'),
   ('bloquear_folio_monto_hotel', 'false'),
   ('sat_validacion_activa', 'true'),
+  -- Contabilización a SAP al compensar (Configuración → Contabilización a SAP). Apagada por omisión.
+  ('sap_contabilizacion_activa', 'false'),
+  ('sap_modo', '"simulado"'),
+  ('sap_cuentas', '{}'),
   -- Palabras que rechazan una factura al subirla (Configuración → Productos no permitidos en facturas).
   ('palabras_prohibidas_alcohol', '["cerveza","vino","tequila","mezcal","whisky","whiskey","ron","vodka","ginebra","brandy","coñac","cognac","licor","sidra","champagne","champaña","aguardiente","bacardi","destilado"]'),
   ('palabras_prohibidas_tabaco', '["cigarro","cigarrillo","cigarrillos","vape","vapeador","tabaco","puro","nicotina","habano"]'),

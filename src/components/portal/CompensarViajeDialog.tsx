@@ -1,9 +1,9 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Scale } from "lucide-react";
 import { toast } from "sonner";
 import { showErrorDialog } from "@/components/ErrorDialog";
 import { api } from "@/lib/api";
-import { useApiMutation, useResumenCompensacion } from "@/lib/queries";
+import { useApiMutation, useResumenCompensacion, useVistaSap } from "@/lib/queries";
 import {
   DECISION_COMPENSACION,
   fmtTarifa,
@@ -12,6 +12,7 @@ import {
   type Solicitud,
 } from "@/lib/store";
 import { Modal } from "@/routes/_portal.solicitar";
+import type { VistaSap } from "@/lib/queries";
 
 // Diálogo "Compensar viaje" (Finanzas / Compras, permiso compensar_viaje): muestra por concepto lo solicitado,
 // lo comprobado (con tope en lo solicitado) y lo facturado de más, y registra la decisión sobre ese excedente.
@@ -27,6 +28,10 @@ export function CompensarViajeDialog({
 }) {
   const { data, isLoading } = useResumenCompensacion(solicitud.id);
   const r = data?.resumen;
+  // Contabilización a SAP: si está activa, compensar solo procede cuando SAP confirma el asiento.
+  const { data: sap, refetch: refrescarSap } = useVistaSap(solicitud.id);
+  const sapActivo = !!sap?.activo;
+  const bloqueos = sap?.bloqueos ?? [];
   const hayExcedente = (r?.excedente ?? 0) > 0;
   const [decision, setDecision] = useState<"reembolsar" | "no_reembolsar">("no_reembolsar");
   const [monto, setMonto] = useState("");
@@ -37,14 +42,25 @@ export function CompensarViajeDialog({
       api.post(`/solicitudes/${solicitud.id}/compensar`, body),
     {
       onSuccess: () => {
-        toast.success(`Viaje ${solicitud.folio} compensado.`);
+        toast.success(
+          sapActivo
+            ? `Viaje ${solicitud.folio} compensado y contabilizado en SAP.`
+            : `Viaje ${solicitud.folio} compensado.`,
+        );
         onListo();
       },
     },
   );
 
+  // Si SAP no confirmó, el estado del envío (y su error) cambió en el servidor: se vuelve a leer.
+  useEffect(() => {
+    if (compensar.isError) void refrescarSap();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [compensar.isError]);
+
   const enviar = () => {
     if (!r) return;
+    if (bloqueos.length) return showErrorDialog(bloqueos.join(" "));
     if (!hayExcedente) return compensar.mutate({ decision: "sin_excedente", comentario });
     if (!comentario.trim()) {
       return showErrorDialog("Captura un comentario que justifique la decisión sobre el gasto excedente.");
@@ -75,6 +91,7 @@ export function CompensarViajeDialog({
           <p className="mt-2 text-xs text-muted-foreground">
             Al compensar se cierra el viaje: ya no se podrán subir ni quitar comprobantes y el folio
             saldrá de las vistas por omisión.
+            {sapActivo && " Antes se envía la contabilización a SAP: si SAP no la confirma, el viaje no se compensa."}
           </p>
           <div className="mt-3 overflow-x-auto rounded-lg border">
             <table className="w-full text-xs">
@@ -119,6 +136,8 @@ export function CompensarViajeDialog({
               </tbody>
             </table>
           </div>
+
+          {sapActivo && sap && <AsientoSap vista={sap} />}
 
           {hayExcedente ? (
             <div className="mt-4 space-y-2 text-sm">
@@ -184,8 +203,13 @@ export function CompensarViajeDialog({
             <button onClick={onClose} className="ckl-btn-ghost">
               Cancelar
             </button>
-            <button onClick={enviar} disabled={compensar.isPending} className="ckl-btn-primary">
-              <Scale size={14} /> Compensar viaje
+            <button
+              onClick={enviar}
+              disabled={compensar.isPending || bloqueos.length > 0}
+              className="ckl-btn-primary disabled:opacity-60"
+            >
+              <Scale size={14} />{" "}
+              {compensar.isPending ? "Enviando a SAP…" : sapActivo ? "Compensar y enviar a SAP" : "Compensar viaje"}
             </button>
           </div>
         </>
@@ -211,6 +235,86 @@ export function ResumenCompensado({ c, quien }: { c: Compensacion; quien: string
         {c.decision === "reembolsar" && <> · Reembolso: <b>{fmtTarifa(c.monto_reembolso)}</b></>}
       </div>
       {c.comentario && <div className="mt-1 italic">“{c.comentario}”</div>}
+      {c.documento_sap && (
+        <div className="mt-1">
+          Contabilizado en SAP · documento <b>{c.documento_sap}</b>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Vista previa del asiento que se enviará a SAP: líneas por cuenta (gasto, IVA por tasa, retenciones y contrapartida),
+// avisos y lo que impide enviar. Las cuentas salen de Configuración; el IVA y los importes, del XML.
+function AsientoSap({ vista }: { vista: VistaSap }) {
+  const p = vista.payload;
+  if (!p) return null;
+  const bloqueos = vista.bloqueos ?? [];
+  const avisos = [
+    ...(vista.faltantes?.length && vista.modo === "simulado"
+      ? [`Faltan cuentas contables por configurar (no bloquea en modo simulado): ${vista.faltantes.join(", ")}.`]
+      : []),
+    ...(vista.advertencias ?? []),
+  ];
+  return (
+    <div className="mt-4 rounded-lg border p-3 text-xs">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="text-sm font-semibold">Contabilización a SAP · referencia {p.referencia}</div>
+        <span
+          className="rounded px-2 py-0.5 font-semibold"
+          style={{ background: vista.modo === "real" ? "#D8F3DC" : "#FEF3C7", color: vista.modo === "real" ? "#2D6A4F" : "#B45309" }}
+        >
+          Modo {vista.modo}
+        </span>
+      </div>
+      {vista.envio?.estado === "error" && (
+        <div className="mt-2 rounded-md p-2" style={{ background: "#FEE9EA", color: "#B5040F" }}>
+          El último envío falló{vista.envio.error ? `: ${vista.envio.error}` : "."} Puedes volver a intentarlo.
+        </div>
+      )}
+      {bloqueos.length > 0 && (
+        <ul className="mt-2 space-y-1 rounded-md p-2" style={{ background: "#FEE9EA", color: "#B5040F" }}>
+          {bloqueos.map((b) => (
+            <li key={b}>• {b}</li>
+          ))}
+        </ul>
+      )}
+      <div className="mt-2 max-h-48 overflow-auto rounded border">
+        <table className="w-full">
+          <thead className="bg-secondary text-left text-muted-foreground">
+            <tr>
+              <th className="p-1.5">Cuenta</th>
+              <th className="p-1.5">Descripción</th>
+              <th className="p-1.5 text-right">Debe</th>
+              <th className="p-1.5 text-right">Haber</th>
+            </tr>
+          </thead>
+          <tbody>
+            {p.lineas.map((l, i) => (
+              <tr key={i} className="border-t">
+                <td className="p-1.5 font-mono" style={{ color: l.cuenta ? undefined : "#B5040F" }}>
+                  {l.cuenta ?? "sin cuenta"}
+                </td>
+                <td className="p-1.5">{l.descripcion}</td>
+                <td className="p-1.5 text-right">{l.debe ? fmtTarifa(l.debe) : ""}</td>
+                <td className="p-1.5 text-right">{l.haber ? fmtTarifa(l.haber) : ""}</td>
+              </tr>
+            ))}
+            <tr className="border-t-2 bg-secondary font-semibold">
+              <td className="p-1.5" colSpan={2}>Totales</td>
+              <td className="p-1.5 text-right">{fmtTarifa(p.totales.debe)}</td>
+              <td className="p-1.5 text-right">{fmtTarifa(p.totales.haber)}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      {avisos.length > 0 && (
+        <ul className="mt-2 space-y-1 text-muted-foreground">
+          {avisos.map((a) => (
+            <li key={a}>• {a}</li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }

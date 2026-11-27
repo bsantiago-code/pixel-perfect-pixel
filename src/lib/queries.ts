@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { api, reportApiError } from "./api";
 import { PALABRAS_DEFAULT } from "./palabras-prohibidas";
+import type { PayloadSap } from "./sap";
 import type {
   Autorizacion,
   Compensacion,
@@ -57,6 +58,11 @@ export type Config = {
   revision_automatica_activo: boolean;
   bloquear_folio_monto_hotel: boolean;
   sat_validacion_activa: boolean;
+  // Contabilización a SAP al compensar el viaje (apagada por omisión). Las cuentas van por clave: concepto:<Concepto>,
+  // iva_trasladado_16, iva_retenido, contrapartida… (ver CUENTAS_FIJAS en sap.ts).
+  sap_contabilizacion_activa: boolean;
+  sap_modo: "simulado" | "real";
+  sap_cuentas: Record<string, string>;
   palabras_prohibidas_alcohol: string[];
   palabras_prohibidas_tabaco: string[];
   palabras_prohibidas_higiene: string[];
@@ -81,6 +87,9 @@ export const CONFIG_DEFAULTS: Config = {
   revision_automatica_activo: true,
   bloquear_folio_monto_hotel: false,
   sat_validacion_activa: true,
+  sap_contabilizacion_activa: false,
+  sap_modo: "simulado",
+  sap_cuentas: {},
   palabras_prohibidas_alcohol: PALABRAS_DEFAULT.alcohol,
   palabras_prohibidas_tabaco: PALABRAS_DEFAULT.tabaco,
   palabras_prohibidas_higiene: PALABRAS_DEFAULT.higiene,
@@ -215,6 +224,23 @@ export const useResumenCompensacion = (solicitudId: string | null | undefined) =
       api.get<{ resumen: ResumenCompensacion; compensacion: Compensacion | null }>(
         `/solicitudes/${solicitudId}/compensacion`,
       ),
+    enabled: !!solicitudId,
+  });
+
+// Vista previa del asiento a SAP al compensar (y estado del último envío); con la contabilización apagada solo trae activo:false.
+export type VistaSap = {
+  activo: boolean;
+  modo: "simulado" | "real";
+  payload?: PayloadSap;
+  faltantes?: string[];
+  advertencias?: string[];
+  bloqueos?: string[];
+  envio: { estado: string; documento_sap: string | null; error: string | null; intentos: number; enviado_at: string | null } | null;
+};
+export const useVistaSap = (solicitudId: string | null | undefined) =>
+  useQuery({
+    queryKey: ["contabilizacion", solicitudId],
+    queryFn: () => api.get<VistaSap>(`/solicitudes/${solicitudId}/contabilizacion`),
     enabled: !!solicitudId,
   });
 

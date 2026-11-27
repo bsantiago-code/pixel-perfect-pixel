@@ -10,6 +10,7 @@ import { authRouter } from "./routes/auth.ts";
 import { comprobacionRouter } from "./routes/comprobacion.ts";
 import { comprasRouter } from "./routes/compras.ts";
 import { compensacionesRouter } from "./routes/compensaciones.ts";
+import { presupuestosRouter } from "./routes/presupuestos.ts";
 import { solicitudesRouter } from "./routes/solicitudes.ts";
 import { cifrarSecretosPendientes, exigirLlave } from "./seguridad.ts";
 import { validarConfigAlmacen } from "./storage/index.ts";
@@ -31,6 +32,7 @@ app.use("/api", solicitudesRouter);
 app.use("/api", comprobacionRouter);
 app.use("/api", comprasRouter);
 app.use("/api", compensacionesRouter);
+app.use("/api", presupuestosRouter);
 
 app.use("/api", () => {
   throw new HttpError(404, "Ruta no encontrada.");

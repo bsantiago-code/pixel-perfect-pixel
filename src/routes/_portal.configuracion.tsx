@@ -371,6 +371,37 @@ function Configuracion() {
               />
             </button>
           </div>
+          <div className="flex items-center justify-between gap-4 rounded-lg border p-3">
+            <div>
+              <div className="text-sm font-semibold">Bloquear autorización sin presupuesto</div>
+              <div className="text-xs text-muted-foreground">
+                Si está activo, no se puede autorizar un folio que exceda el disponible del presupuesto
+                de su departamento (o cuyo departamento no tenga presupuesto para esa fecha).
+                Desactivado: quien autoriza solo ve el aviso y queda registrado en la bitácora.
+              </div>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={!!draft.bloquear_autorizacion_sin_presupuesto}
+              aria-label="Bloquear autorización sin presupuesto"
+              onClick={() =>
+                setDraft({
+                  ...draft,
+                  bloquear_autorizacion_sin_presupuesto: !draft.bloquear_autorizacion_sin_presupuesto,
+                })
+              }
+              className="relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors"
+              style={{ background: draft.bloquear_autorizacion_sin_presupuesto ? "var(--color-primary)" : "#ccc" }}
+            >
+              <span
+                className="inline-block h-4 w-4 transform rounded-full bg-white transition-transform"
+                style={{
+                  transform: draft.bloquear_autorizacion_sin_presupuesto ? "translateX(18px)" : "translateX(2px)",
+                }}
+              />
+            </button>
+          </div>
         </div>
         <button onClick={saveCfg} className="ckl-btn-primary mt-4">Guardar</button>
       </div>

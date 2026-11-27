@@ -43,6 +43,7 @@ import {
   avanceValidacion,
   bloqueoMontoHotel,
   estatusVisible,
+  evaluarPresupuestoFolio,
   pasoAutorizacion,
   requiereAccion,
   ESTATUS_VISIBLES,
@@ -50,6 +51,7 @@ import {
   type Hotel,
 } from "@/lib/store";
 import { Paginacion, usePaginacion } from "@/components/portal/Paginacion";
+import { PresupuestoFolioCard } from "@/components/portal/PresupuestoFolioCard";
 import { CompensarViajeDialog, ResumenCompensado } from "@/components/portal/CompensarViajeDialog";
 import { StatusBadge } from "./_portal.dashboard";
 
@@ -136,13 +138,19 @@ function Estatus() {
     avanceComprobacion(comprobantesGasto, solicitudId, false, depositos).completo;
   // Etiqueta que ve el usuario (Pendiente/Autorizado/Comprobado/Rechazado); el
   // valor guardado en s.estatus sigue siendo Abierto/Cerrado/Rechazado.
-  const etiquetaEstatus = (s: Solicitud) => estatusVisible(s.estatus, estaComprobado(s.id));
+  const etiquetaEstatus = (s: Solicitud) => estatusVisible(s.estatus, estaComprobado(s.folio));
   // Marca de "Validado por Compras" (todos los conceptos validados) junto al estatus.
   const estaValidado = (solicitudId: string) =>
     avanceValidacion(comprobantesGasto, solicitudId).completa;
   // Folio bloqueado para autorizar por monto manual de hotel (si el parámetro está activo).
   const bloqueoDe = (s: Solicitud) =>
-    s.estatus === "Abierto" ? bloqueoMontoHotel(s.id, revisionesMonto, config) : null;
+    s.estatus === "Abierto" ? bloqueoMontoHotel(s.folio, revisionesMonto, config) : null;
+  // Presupuesto del departamento del folio abierto en el detalle (solo llega a quien autoriza o administra
+  // presupuestos). Con el parámetro de bloqueo activo, un folio que excede no se puede autorizar.
+  const infoPresupuesto = detail && detalle?.solicitud.id === detail.id ? detalle.presupuesto : undefined;
+  const evalPresupuesto = detail ? evaluarPresupuestoFolio(infoPresupuesto, detail, config) : null;
+  const bloqueoAutorizar = (s: Solicitud) =>
+    bloqueoDe(s) ?? (detail?.id === s.id ? (evalPresupuesto?.bloqueo ?? null) : null);
   const marcaBloqueo = (s: Solicitud) => {
     const motivo = bloqueoDe(s);
     return motivo ? (
@@ -154,7 +162,7 @@ function Estatus() {
   // Viaje compensado (cerrado por Finanzas/Compras).
   const compensacionDe = (solicitudId: string) => compensaciones.find((c) => c.solicitud_id === solicitudId);
   const marcaCompensado = (s: Solicitud) =>
-    compensacionDe(s.id) ? (
+    compensacionDe(s.folio) ? (
       <span
         className="ckl-badge ml-1 align-middle"
         style={{ background: "#EEF2FF", color: "#3730A3" }}
@@ -167,11 +175,11 @@ function Estatus() {
   const puedeCompensar = (s: Solicitud) =>
     hasPerm("compensar_viaje") &&
     s.estatus === "Cerrado" &&
-    estaComprobado(s.id) &&
-    estaValidado(s.id) &&
-    !compensacionDe(s.id);
+    estaComprobado(s.folio) &&
+    estaValidado(s.folio) &&
+    !compensacionDe(s.folio);
   const marcaValidado = (s: Solicitud) =>
-    s.estatus === "Cerrado" && estaValidado(s.id) ? (
+    s.estatus === "Cerrado" && estaValidado(s.folio) ? (
       <span
         className="ml-1 inline-flex align-middle"
         style={{ color: "#2D6A4F" }}
@@ -185,7 +193,7 @@ function Estatus() {
   const esValidador = hasPerm("validar_comprobacion") && !hasPerm("comprobar");
   const abrirFolio = (s: Solicitud) => {
     // Ya validado: abre el detalle (ahí está "Compensar viaje" o el resumen de la compensación).
-    if (esValidador && s.estatus === "Cerrado" && estaComprobado(s.id) && !estaValidado(s.id)) {
+    if (esValidador && s.estatus === "Cerrado" && estaComprobado(s.folio) && !estaValidado(s.folio)) {
       nav({ to: "/comprobacion", search: { solicitudId: s.id } });
       return;
     }
@@ -224,20 +232,20 @@ function Estatus() {
               userId: user?.id,
               permisos: role?.permisos,
               umbral,
-              comprobado: comprobado(s.id),
-              validado: validado(s.id),
-              compensado: compensados.has(s.id),
+              comprobado: comprobado(s.folio),
+              validado: validado(s.folio),
+              compensado: compensados.has(s.folio),
             })
           : estado === FILTRO_COMPENSADO
-            ? compensados.has(s.id)
+            ? compensados.has(s.folio)
             : // Los compensados no se mezclan con "Comprobado" (tienen su propia opción).
-              !compensados.has(s.id) && estatusVisible(s.estatus, comprobado(s.id)) === estado);
+              !compensados.has(s.folio) && estatusVisible(s.estatus, comprobado(s.folio)) === estado);
       const diasTranscurridos = (Date.now() - new Date(s.created_at).getTime()) / 86400000;
       const matchU = usuarioFiltro === "Todos" || s.user_id === usuarioFiltro;
       const matchAtrasados =
         !soloAtrasados ||
         (s.estatus === "Cerrado" &&
-          !comprobado(s.id) &&
+          !comprobado(s.folio) &&
           diasTranscurridos > diasComprobacionAtrasada);
       return matchQ && matchE && matchU && matchAtrasados;
     });
@@ -261,20 +269,20 @@ function Estatus() {
   // en el modal, para que quien autoriza vea qué compone el monto total.
   const destinosDetail: DestinoApi[] = detail ? (detalle?.destinos ?? []) : [];
   const resumenMontos = useMemo(
-    () => (detail ? comprobantesGasto.filter((c) => c.solicitud_id === detail.id) : []),
+    () => (detail ? comprobantesGasto.filter((c) => c.solicitud_id === detail.folio) : []),
     [detail, comprobantesGasto],
   );
 
   const userName = (id: string) => users.find((u) => u.id === id)?.nombre ?? "—";
 
-  const canEdit = (s: Solicitud) => s.user_id === user?.id && s.estatus === "Abierto" && !autorizaciones.find((a) => a.solicitud_id === s.id);
+  const canEdit = (s: Solicitud) => s.user_id === user?.id && s.estatus === "Abierto" && !autorizaciones.find((a) => a.solicitud_id === s.folio);
 
   // Nadie autoriza ni rechaza su propia solicitud; el paso de Jefe no depende del monto (ver pasoAutorizacion).
   const canAuth = (s: Solicitud) => pasoAutorizacion(s, user?.id, role?.permisos, umbral);
 
   // Hoteles del folio con monto modificado manualmente (cada uno abrió una revisión de Compras).
   const hotelesManuales = (s: Solicitud) =>
-    revisionesMonto.filter((r) => r.solicitud_id === s.id && r.vigente !== false);
+    revisionesMonto.filter((r) => r.solicitud_id === s.folio && r.vigente !== false);
 
   // El servidor aplica las reglas (quién autoriza, umbral, bloqueo por monto manual, cierre) y exige
   // confirmar el aviso de hotel manual (`confirmo_hotel_manual`), así que el aviso no se puede omitir.
@@ -351,7 +359,7 @@ function Estatus() {
     },
   });
   const eliminar = (s: Solicitud) => {
-    if (autorizaciones.find((a) => a.solicitud_id === s.id)) return showErrorDialog("No se puede eliminar: ya tiene autorizaciones.");
+    if (autorizaciones.find((a) => a.solicitud_id === s.folio)) return showErrorDialog("No se puede eliminar: ya tiene autorizaciones.");
     if (!confirm(`¿Eliminar solicitud ${s.folio}?`)) return;
     eliminarMut.mutate(s);
   };
@@ -448,7 +456,7 @@ function Estatus() {
                     <div className="flex items-center justify-between gap-2">
                       <span className="font-mono text-xs font-semibold">{s.folio}</span>
                       <span className="inline-flex items-center">
-                        <StatusBadge estatus={s.estatus} comprobado={estaComprobado(s.id)} />
+                        <StatusBadge estatus={s.estatus} comprobado={estaComprobado(s.folio)} />
                         {marcaValidado(s)}
                         {marcaCompensado(s)}
                         {marcaBloqueo(s)}
@@ -533,7 +541,7 @@ function Estatus() {
                         : <span className="ckl-badge" style={{ background: "#FEE2E2", color: "#DC2626" }}>Sin cargar</span>}
                     </td>
                     <td className="p-3">{s.nota_rechazo && <MessageSquareWarning size={16} className="text-[color:var(--color-primary)]" />}</td>
-                    <td className="p-3 whitespace-nowrap"><StatusBadge estatus={s.estatus} comprobado={estaComprobado(s.id)} />{marcaValidado(s)}{marcaCompensado(s)}{marcaBloqueo(s)}</td>
+                    <td className="p-3 whitespace-nowrap"><StatusBadge estatus={s.estatus} comprobado={estaComprobado(s.folio)} />{marcaValidado(s)}{marcaCompensado(s)}{marcaBloqueo(s)}</td>
                   </tr>
                 );
               })}
@@ -579,12 +587,22 @@ function Estatus() {
           </dl>
           <p className="mt-3 text-xs"><b>Motivo:</b> {detail.motivo}</p>
 
+          {/* Presupuesto del departamento: arriba, para verlo antes de autorizar sin desplazarse. */}
+          {infoPresupuesto && evalPresupuesto && detail.estatus !== "Rechazado" && (
+            <PresupuestoFolioCard
+              info={infoPresupuesto}
+              folio={detail}
+              evaluacion={evalPresupuesto}
+              puedeGestionar={hasPerm("gestionar_presupuestos")}
+            />
+          )}
+
           {resumenMontos.length > 0 && (
             <div className="mt-4 border-t pt-3">
               <div className="text-xs font-semibold">Resumen de montos</div>
               <div className="mt-2 grid grid-cols-2 gap-2 text-xs">
                 {resumenMontos.map((c) => (
-                  <div key={c.id}>
+                  <div key={c.concepto}>
                     <div className="text-muted-foreground">{c.concepto}</div>
                     <div className="font-medium">{fmtMoney(c.monto_solicitado)}</div>
                   </div>
@@ -619,7 +637,7 @@ function Estatus() {
                         // El monto de la estancia (de catálogo o manual) siempre es por noche.
                         const subtotal = noches * h.monto;
                         const rev = revisionesMonto.find(
-                          (r) => r.solicitud_id === detail.id && r.hotel_stay_id === h.id && r.vigente !== false,
+                          (r) => r.solicitud_id === detail.folio && r.hotel_stay_id === h.id && r.vigente !== false,
                         );
                         return (
                           <div key={h.id} className="mt-1">
@@ -752,11 +770,11 @@ function Estatus() {
             </div>
           )}
 
-          {compensacionDe(detail.id) && (
+          {compensacionDe(detail.folio) && (
             <div className="mt-4">
               <ResumenCompensado
-                c={compensacionDe(detail.id)!}
-                quien={userName(compensacionDe(detail.id)!.compensado_por)}
+                c={compensacionDe(detail.folio)!}
+                quien={userName(compensacionDe(detail.folio)!.compensado_por)}
               />
             </div>
           )}
@@ -797,8 +815,8 @@ function Estatus() {
                 <button onClick={() => setRejecting(detail)} className="ckl-btn-outline"><X size={14} /> Rechazar</button>
                 <button
                   onClick={() => authorize(detail)}
-                  disabled={!!bloqueoDe(detail)}
-                  title={bloqueoDe(detail) ?? undefined}
+                  disabled={!!bloqueoAutorizar(detail)}
+                  title={bloqueoAutorizar(detail) ?? undefined}
                   className="ckl-btn-primary"
                 >
                   <Check size={14} /> Autorizar
@@ -811,8 +829,8 @@ function Estatus() {
               </button>
             )}
             {hasPerm("configurar_permisos") &&
-              !compensacionDe(detail.id) &&
-              autorizaciones.some((a) => a.solicitud_id === detail.id) && (
+              !compensacionDe(detail.folio) &&
+              autorizaciones.some((a) => a.solicitud_id === detail.folio) && (
               <button onClick={() => revertir(detail)} className="ckl-btn-outline">
                 <RotateCcw size={14} /> Revertir autorización
               </button>

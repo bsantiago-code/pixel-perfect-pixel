@@ -105,7 +105,7 @@ export function CompensarViajeDialog({
               </thead>
               <tbody>
                 {r.conceptos.map((c) => (
-                  <tr key={c.id} className="border-t">
+                  <tr key={c.concepto} className="border-t">
                     <td className="p-2">{c.concepto}</td>
                     <td className="p-2 text-right">{fmtTarifa(c.solicitado)}</td>
                     <td className="p-2 text-right">{fmtTarifa(c.comprobado)}</td>

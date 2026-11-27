@@ -106,7 +106,7 @@ function Comprobacion() {
     () =>
       solicitudes
         .filter((s) => s.estatus === "Cerrado")
-        .filter((s) => !soloValidador || avanceComprobacion(comprobantes, s.id, false, depositos).completo),
+        .filter((s) => !soloValidador || avanceComprobacion(comprobantes, s.folio, false, depositos).completo),
     [solicitudes, comprobantes, depositos, soloValidador],
   );
   const nav = useNavigate();
@@ -116,8 +116,8 @@ function Comprobacion() {
   const porDefecto = (
     cerradas.find((s) =>
       soloValidador
-        ? !avanceValidacion(comprobantes, s.id).completa
-        : !avanceComprobacion(comprobantes, s.id, false, depositos).completo,
+        ? !avanceValidacion(comprobantes, s.folio).completa
+        : !avanceComprobacion(comprobantes, s.folio, false, depositos).completo,
     ) ?? cerradas[0]
   )?.id ?? "";
   const [sidState, setSid] = useState<string>(() =>
@@ -142,25 +142,29 @@ function Comprobacion() {
   const rows = useMemo(
     () =>
       comprobantes
-        .filter((c) => c.solicitud_id === sid)
+        .filter((c) => c.solicitud_id === sel?.folio) // solicitud_id del renglón = folio
         .filter((c) => !soloAvion || c.concepto === "Avión"),
-    [comprobantes, sid, soloAvion],
+    [comprobantes, sel, soloAvion],
   );
   const { data: facturasData } = useFacturas(sid || null);
   const fs = lista(facturasData);
   const [log, setLog] = useState<string[]>([]);
   // Viaje compensado: sus comprobantes quedan congelados (sin subir, quitar ni validar).
   const { data: compensacionesData } = useCompensaciones();
-  const compensacion = lista(compensacionesData).find((c) => c.solicitud_id === sid);
+  const compensacion = lista(compensacionesData).find((c) => c.solicitud_id === sel?.folio);
   const compensado = !!compensacion;
   const [compensando, setCompensando] = useState(false);
 
   const addLog = (line: string) =>
     setLog((l) => [`${new Date().toTimeString().slice(0, 8)} ${line}`, ...l].slice(0, 50));
 
-  const subirMut = useApiMutation((v: { id: string; fd: FormData }) =>
+  // Un renglón se identifica por (folio, concepto): ambos van codificados en la URL (#, acentos, espacios).
+  const urlRenglon = (r: { solicitud_id: string; concepto: string }) =>
+    `/comprobacion/renglones/${encodeURIComponent(r.solicitud_id)}/${encodeURIComponent(r.concepto)}`;
+
+  const subirMut = useApiMutation((v: { r: ComprobanteGasto; fd: FormData }) =>
     api.post<{ renglon: unknown; uuid: string; total: number; excedente: number }>(
-      `/comprobacion/renglones/${v.id}/facturas`,
+      `${urlRenglon(v.r)}/facturas`,
       v.fd,
     ),
   );
@@ -197,7 +201,7 @@ function Comprobacion() {
     if (!esVales && archivos.xml) fd.append("xml", archivos.xml);
     if (archivos.pdf) fd.append("pdf", archivos.pdf);
     try {
-      const r = await subirMut.mutateAsync({ id: concepto.id, fd });
+      const r = await subirMut.mutateAsync({ r: concepto, fd });
       addLog(
         esVales
           ? `✔ Comprobante de vales cargado: ${archivos.pdf!.name}`
@@ -218,27 +222,27 @@ function Comprobacion() {
 
   // ── Validación de Compras Corporativas
   const validacionMut = useApiMutation(
-    (v: { id: string; body: { validado?: boolean; nota?: string }; msg: string }) =>
-      api.patch(`/comprobacion/renglones/${v.id}/validacion`, v.body),
+    (v: { r: ComprobanteGasto; body: { validado?: boolean; nota?: string }; msg: string }) =>
+      api.patch(`${urlRenglon(v.r)}/validacion`, v.body),
     { onSuccess: (_r, v) => toast.success(v.msg) },
   );
 
   const toggleValidado = (r: ComprobanteGasto) => {
     if (r.validado) {
       validacionMut.mutate({
-        id: r.id,
+        r,
         body: { validado: false },
         msg: `Validación de "${r.concepto}" retirada.`,
       });
     } else {
-      validacionMut.mutate({ id: r.id, body: { validado: true }, msg: `"${r.concepto}" validado.` });
+      validacionMut.mutate({ r, body: { validado: true }, msg: `"${r.concepto}" validado.` });
     }
   };
 
   const guardarNota = (r: ComprobanteGasto, texto: string) => {
     const t = texto.trim();
     if ((r.nota_validacion ?? "") === t) return;
-    validacionMut.mutate({ id: r.id, body: { nota: t }, msg: "Nota guardada." });
+    validacionMut.mutate({ r, body: { nota: t }, msg: "Nota guardada." });
   };
 
   // Elimina el comprobante completo (XML + PDF); el servidor revierte el monto del renglón.
@@ -252,7 +256,8 @@ function Comprobacion() {
   const removeGrupo = (g: Factura[]) => eliminarMut.mutate(g);
 
   // Depósito sobrante: ficha bancaria + monto; suma al comprobado del folio (sin acción a SAP por ahora).
-  const depositosFolio = useMemo(() => depositos.filter((d) => d.solicitud_id === sid), [depositos, sid]);
+  // solicitud_id de los depósitos = folio (como el de los renglones y facturas).
+  const depositosFolio = useMemo(() => depositos.filter((d) => d.solicitud_id === sel?.folio), [depositos, sel]);
   const subirDepositoMut = useApiMutation(
     (v: { solicitudId: string; fd: FormData }) =>
       api.post<Deposito>(`/comprobacion/solicitudes/${v.solicitudId}/depositos`, v.fd),
@@ -310,7 +315,7 @@ function Comprobacion() {
   const avanceDe = (solicitudId: string) =>
     avanceComprobacion(comprobantes, solicitudId, soloAvion, depositos);
   const validacionDe = (solicitudId: string) => avanceValidacion(comprobantes, solicitudId);
-  const validacion = validacionDe(sid);
+  const validacion = validacionDe(sel.folio); // avanceValidacion recibe el FOLIO (con sid —id interno— nunca coincidía)
   const insignia = !comprobado
     ? { texto: "Pendiente de comprobar", bg: "#FEF3C7", fg: "#B45309" }
     : validacion.completa
@@ -354,7 +359,7 @@ function Comprobacion() {
       return (
         <input
           // key con la nota guardada: el campo se refresca si cambia desde otro lado
-          key={r.id + "|" + (r.nota_validacion ?? "")}
+          key={r.concepto + "|" + (r.nota_validacion ?? "")}
           className="ckl-input min-w-[150px]"
           defaultValue={r.nota_validacion ?? ""}
           placeholder="Observación (opcional)"
@@ -415,7 +420,7 @@ function Comprobacion() {
   // Un comprobante = XML + PDF (par) o un archivo suelto (vales / heredado).
   const grupos = agruparFacturas(fs);
   const estadoGrupo = (g: Factura[]) => {
-    const concepto = comprobantes.find((c) => c.id === g[0].concepto_id)?.concepto ?? "";
+    const concepto = g[0].concepto ?? "";
     if (g.some((f) => f.status === "Incompleto") || (g.length === 1 && concepto && conceptoRequierePar(concepto) && !g[0].par_id && g[0].status !== "Error")) {
       const falta = g[0].tipo === "XML" ? "PDF" : "XML";
       return { texto: `Incompleto · falta ${falta}`, bg: "#FEF3C7", fg: "#B45309" };
@@ -499,7 +504,7 @@ function Comprobacion() {
           {rows.map((r) => {
             const dif = r.monto_comprobado - r.monto_solicitado;
             return (
-              <li key={r.id} className="space-y-2 p-3">
+              <li key={r.concepto} className="space-y-2 p-3">
                 <div className="flex items-center justify-between gap-2">
                   <span className="text-sm font-medium">{r.concepto}</span>
                   {badgeRenglon(r)}
@@ -563,7 +568,7 @@ function Comprobacion() {
               {rows.map((r) => {
                 const dif = r.monto_comprobado - r.monto_solicitado;
                 return (
-                  <tr key={r.id} className="border-t">
+                  <tr key={r.concepto} className="border-t">
                     <td className="p-3">{r.concepto}</td>
                     <td className="p-3 text-right">{fmtMoney(r.monto_solicitado)}</td>
                     <td className="p-3 text-right">{fmtMoney(r.monto_comprobado)}</td>
@@ -641,7 +646,7 @@ function Comprobacion() {
           )}
           {paginaGrupos.map((g) => {
             const f = g[0];
-            const concepto = comprobantes.find((c) => c.id === f.concepto_id)?.concepto ?? "—";
+            const concepto = f.concepto ?? "—";
             const est = estadoGrupo(g);
             return (
               <li key={f.id} className="p-3">
@@ -721,7 +726,7 @@ function Comprobacion() {
               )}
               {paginaGrupos.map((g) => {
                 const f = g[0];
-                const concepto = comprobantes.find((c) => c.id === f.concepto_id)?.concepto ?? "—";
+                const concepto = f.concepto ?? "—";
                 const est = estadoGrupo(g);
                 return (
                   <tr key={f.id} className="border-t align-top">
@@ -1008,7 +1013,7 @@ function FolioPicker({
     return solicitudes.filter((s) => {
       if (t && ![s.folio, s.destino_resumen, s.fecha, s.empresa].some((v) => v.toLowerCase().includes(t)))
         return false;
-      const hecho = soloValidador ? validacionDe(s.id).completa : avanceDe(s.id).completo;
+      const hecho = soloValidador ? validacionDe(s.folio).completa : avanceDe(s.folio).completo;
       if (filtro === opcionesFiltro[0]) return !hecho; // Pendientes por comprobar / Por validar
       if (filtro === opcionesFiltro[1]) return hecho; // Comprobados / Validados
       return true;
@@ -1017,8 +1022,8 @@ function FolioPicker({
   const { visibles: paginaFolios, paginacion } = usePaginacion(visibles);
 
   const renderCard = (s: Solicitud) => {
-    const a = avanceDe(s.id);
-    const v = validacionDe(s.id);
+    const a = avanceDe(s.folio);
+    const v = validacionDe(s.folio);
     const activo = s.id === selectedId;
     const tag = !a.completo
       ? { t: "Pendiente", bg: "#FEF3C7", fg: "#B45309" }

@@ -20,6 +20,7 @@ const MODULOS: { key: string; label: string }[] = [
   { key: "gestionar_convenios", label: "Gestionar convenios con hoteles" },
   { key: "compensar_viaje", label: "Compensar viaje (cierre y reembolso de excedente)" },
   { key: "ver_gasto_por_concepto", label: "Ver gasto por concepto (Dashboard y reporte)" },
+  { key: "gestionar_presupuestos", label: "Gestionar presupuestos por departamento" },
   { key: "ver_equipo", label: "Ver equipo" },
   { key: "ver_todo", label: "Ver todo" },
   { key: "autorizar_lte5000", label: "Autorizar ≤ umbral" },

@@ -163,7 +163,7 @@ function Solicitar() {
     const puedeEditar =
       found.user_id === user?.id &&
       found.estatus === "Abierto" &&
-      !detalle.autorizaciones.some((a) => a.solicitud_id === found.id);
+      !detalle.autorizaciones.some((a) => a.solicitud_id === found.folio);
     return puedeEditar ? found : null;
   }, [editId, detalle, user?.id]);
 
@@ -577,7 +577,7 @@ function Tot({ label, v }: { label: string; v: number }) {
 // el navegador (los <input type="date"> nativos usan el formato/locale del
 // navegador — en Safari puede no ser dd/mm/aaaa). value/onChange usan el mismo
 // formato ISO (yyyy-mm-dd) que ya maneja el resto de las validaciones.
-function DateField({
+export function DateField({
   value,
   onChange,
   min,

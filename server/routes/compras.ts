@@ -190,7 +190,7 @@ comprasRouter.get("/revisiones-monto", async (req, res) => {
   const list = revisor
     ? await rows<R>("SELECT * FROM revisiones_monto ORDER BY creada_at DESC")
     : await rows<R>(
-        `SELECT r.* FROM revisiones_monto r JOIN solicitudes s ON s.id = r.solicitud_id
+        `SELECT r.* FROM revisiones_monto r JOIN solicitudes s ON s.folio = r.solicitud_id
           WHERE ${alcance.sql} ORDER BY r.creada_at DESC`,
         alcance.params,
       );

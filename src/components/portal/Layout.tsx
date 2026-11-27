@@ -2,7 +2,7 @@ import { Link, Outlet, useLocation, useNavigate } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import {
   LayoutDashboard, FilePlus2, ListChecks, ReceiptText, BarChart3,
-  Users, ShieldCheck, Settings, Menu, Plus, X, Handshake, UserPlus,
+  Users, ShieldCheck, Settings, Menu, Plus, X, Handshake, UserPlus, PiggyBank,
 } from "lucide-react";
 import { useAuth } from "@/lib/auth";
 import { lista, useBloqueoNuevaSolicitud, usePreregistros, useSolicitudes } from "@/lib/queries";
@@ -47,6 +47,7 @@ export function PortalLayout() {
     { to: "/comprobacion", label: "Comprobación", icon: ReceiptText, section: "Viáticos", perm: "comprobar" },
     { to: "/reportes", label: "Reportes", icon: BarChart3, section: "Viáticos", perm: "ver_reportes" },
     { to: "/convenios", label: "Convenios", icon: Handshake, section: "Administración", perm: "gestionar_convenios" },
+    { to: "/presupuestos", label: "Presupuestos", icon: PiggyBank, section: "Administración", perm: "gestionar_presupuestos" },
     { to: "/usuarios", label: "Usuarios", icon: Users, section: "Administración" },
     { to: "/preregistros", label: "Pre-Registros", icon: UserPlus, section: "Administración", badge: pendientesPre },
     { to: "/permisos", label: "Permisos", icon: ShieldCheck, section: "Administración", perm: "configurar_permisos" },

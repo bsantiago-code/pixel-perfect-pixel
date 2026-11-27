@@ -198,7 +198,7 @@ function Dashboard() {
     atrasados: solicitudesVisiblesEnEstatus.filter(
       (s) =>
         s.estatus === "Cerrado" &&
-        !estaComprobado(s.id) &&
+        !estaComprobado(s.folio) &&
         (Date.now() - new Date(s.created_at).getTime()) / 86400000 > diasComprobacionAtrasada,
     ).length,
     enTiempo: solicitudes.filter((s) => s.estatus === "Cerrado" && s.comprobante_viaje).length,
@@ -363,7 +363,7 @@ function Dashboard() {
                     <td className="p-3 text-xs">{s.destino_resumen}</td>
                     <td className="p-3 text-right font-semibold">{fmtMoney(s.monto_total)}</td>
                     <td className="p-3">
-                      <StatusBadge estatus={s.estatus} comprobado={estaComprobado(s.id)} />
+                      <StatusBadge estatus={s.estatus} comprobado={estaComprobado(s.folio)} />
                     </td>
                   </tr>
                 );

@@ -15,6 +15,7 @@ import { Route as IndexRouteImport } from './routes/index'
 import { Route as PortalUsuariosRouteImport } from './routes/_portal.usuarios'
 import { Route as PortalSolicitarRouteImport } from './routes/_portal.solicitar'
 import { Route as PortalReportesRouteImport } from './routes/_portal.reportes'
+import { Route as PortalPresupuestosRouteImport } from './routes/_portal.presupuestos'
 import { Route as PortalPreregistrosRouteImport } from './routes/_portal.preregistros'
 import { Route as PortalPermisosRouteImport } from './routes/_portal.permisos'
 import { Route as PortalEstatusRouteImport } from './routes/_portal.estatus'
@@ -50,6 +51,11 @@ const PortalSolicitarRoute = PortalSolicitarRouteImport.update({
 const PortalReportesRoute = PortalReportesRouteImport.update({
   id: '/reportes',
   path: '/reportes',
+  getParentRoute: () => PortalRoute,
+} as any)
+const PortalPresupuestosRoute = PortalPresupuestosRouteImport.update({
+  id: '/presupuestos',
+  path: '/presupuestos',
   getParentRoute: () => PortalRoute,
 } as any)
 const PortalPreregistrosRoute = PortalPreregistrosRouteImport.update({
@@ -98,6 +104,7 @@ export interface FileRoutesByFullPath {
   '/estatus': typeof PortalEstatusRoute
   '/permisos': typeof PortalPermisosRoute
   '/preregistros': typeof PortalPreregistrosRoute
+  '/presupuestos': typeof PortalPresupuestosRoute
   '/reportes': typeof PortalReportesRoute
   '/solicitar': typeof PortalSolicitarRoute
   '/usuarios': typeof PortalUsuariosRoute
@@ -112,6 +119,7 @@ export interface FileRoutesByTo {
   '/estatus': typeof PortalEstatusRoute
   '/permisos': typeof PortalPermisosRoute
   '/preregistros': typeof PortalPreregistrosRoute
+  '/presupuestos': typeof PortalPresupuestosRoute
   '/reportes': typeof PortalReportesRoute
   '/solicitar': typeof PortalSolicitarRoute
   '/usuarios': typeof PortalUsuariosRoute
@@ -128,6 +136,7 @@ export interface FileRoutesById {
   '/_portal/estatus': typeof PortalEstatusRoute
   '/_portal/permisos': typeof PortalPermisosRoute
   '/_portal/preregistros': typeof PortalPreregistrosRoute
+  '/_portal/presupuestos': typeof PortalPresupuestosRoute
   '/_portal/reportes': typeof PortalReportesRoute
   '/_portal/solicitar': typeof PortalSolicitarRoute
   '/_portal/usuarios': typeof PortalUsuariosRoute
@@ -144,6 +153,7 @@ export interface FileRouteTypes {
     | '/estatus'
     | '/permisos'
     | '/preregistros'
+    | '/presupuestos'
     | '/reportes'
     | '/solicitar'
     | '/usuarios'
@@ -158,6 +168,7 @@ export interface FileRouteTypes {
     | '/estatus'
     | '/permisos'
     | '/preregistros'
+    | '/presupuestos'
     | '/reportes'
     | '/solicitar'
     | '/usuarios'
@@ -173,6 +184,7 @@ export interface FileRouteTypes {
     | '/_portal/estatus'
     | '/_portal/permisos'
     | '/_portal/preregistros'
+    | '/_portal/presupuestos'
     | '/_portal/reportes'
     | '/_portal/solicitar'
     | '/_portal/usuarios'
@@ -226,6 +238,13 @@ declare module '@tanstack/react-router' {
       path: '/reportes'
       fullPath: '/reportes'
       preLoaderRoute: typeof PortalReportesRouteImport
+      parentRoute: typeof PortalRoute
+    }
+    '/_portal/presupuestos': {
+      id: '/_portal/presupuestos'
+      path: '/presupuestos'
+      fullPath: '/presupuestos'
+      preLoaderRoute: typeof PortalPresupuestosRouteImport
       parentRoute: typeof PortalRoute
     }
     '/_portal/preregistros': {
@@ -288,6 +307,7 @@ interface PortalRouteChildren {
   PortalEstatusRoute: typeof PortalEstatusRoute
   PortalPermisosRoute: typeof PortalPermisosRoute
   PortalPreregistrosRoute: typeof PortalPreregistrosRoute
+  PortalPresupuestosRoute: typeof PortalPresupuestosRoute
   PortalReportesRoute: typeof PortalReportesRoute
   PortalSolicitarRoute: typeof PortalSolicitarRoute
   PortalUsuariosRoute: typeof PortalUsuariosRoute
@@ -301,6 +321,7 @@ const PortalRouteChildren: PortalRouteChildren = {
   PortalEstatusRoute: PortalEstatusRoute,
   PortalPermisosRoute: PortalPermisosRoute,
   PortalPreregistrosRoute: PortalPreregistrosRoute,
+  PortalPresupuestosRoute: PortalPresupuestosRoute,
   PortalReportesRoute: PortalReportesRoute,
   PortalSolicitarRoute: PortalSolicitarRoute,
   PortalUsuariosRoute: PortalUsuariosRoute,

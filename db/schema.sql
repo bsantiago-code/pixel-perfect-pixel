@@ -26,6 +26,7 @@ SET SQL_MODE = 'STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION,ERROR_FOR_DIVISION_BY
 
 -- ───────────────────────────── 1. Limpieza ─────────────────────────────
 DROP VIEW IF EXISTS v_renglones_gasto;
+DROP VIEW IF EXISTS v_presupuestos;
 DROP PROCEDURE IF EXISTS sp_siguiente_folio;
 DROP PROCEDURE IF EXISTS sp_registrar_log;
 DROP PROCEDURE IF EXISTS sp_autorizar_solicitud;
@@ -36,12 +37,13 @@ DROP PROCEDURE IF EXISTS sp_sincronizar_catalogo_convenios;
 DROP PROCEDURE IF EXISTS sp_dar_baja_convenio;
 DROP PROCEDURE IF EXISTS sp_reactivar_convenio;
 DROP PROCEDURE IF EXISTS sp_gasto_por_concepto;
+DROP PROCEDURE IF EXISTS sp_validar_presupuesto;
 
-DROP TABLE IF EXISTS contabilizaciones, factura_desglose, compensaciones, logs, correos, revisiones_monto, convenios, deposito_archivos, depositos_sobrante,
-  factura_archivos, facturas,
+DROP TABLE IF EXISTS contabilizaciones, factura_desglose, deposito_archivos, depositos_sobrante, presupuestos,
+  compensaciones, logs, correos, revisiones_monto, convenios, factura_archivos, facturas,
   comprobantes_gasto, notas, autorizaciones, destino_vales, destino_transportes, destino_hoteles,
   solicitud_destinos, solicitudes, sesiones, reset_codes, prealtas, usuarios, folio_contador,
-  configuracion, estados_mx, origenes, hoteles, sociedades, roles;
+  configuracion, estados_mx, origenes, hoteles, sociedades, departamentos, roles;
 
 -- ───────────────────────────── 2. Tablas ─────────────────────────────
 -- Catálogos ---------------------------------------------------------------
@@ -63,6 +65,16 @@ CREATE TABLE sociedades (
   sociedad_sap  VARCHAR(20)  NOT NULL DEFAULT '',
   PRIMARY KEY (id),
   UNIQUE KEY uq_sociedades_nombre (nombre)
+) ENGINE=InnoDB;
+
+-- Departamentos (Comercial, Auditoría…): cada uno tiene sus bolsas de presupuesto (tabla presupuestos).
+-- No se borran: se desactivan (activo = 0) para conservar el historial de folios y presupuestos.
+CREATE TABLE departamentos (
+  id      INT          NOT NULL AUTO_INCREMENT,
+  nombre  VARCHAR(80)  NOT NULL,
+  activo  TINYINT(1)   NOT NULL DEFAULT 1,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_departamentos_nombre (nombre)
 ) ENGINE=InnoDB;
 
 CREATE TABLE hoteles (
@@ -117,12 +129,15 @@ CREATE TABLE usuarios (
   activo    TINYINT(1)   NOT NULL DEFAULT 1,
   autorizado_viajar TINYINT(1) NOT NULL DEFAULT 1 COMMENT '0 = "No Autorizado para Viajar" (pre-registro): no puede crear solicitudes hasta que su jefe inmediato lo habilite',
   initials  VARCHAR(4)   NOT NULL DEFAULT '',
+  departamento_id INT    NULL COMMENT 'Departamento cuyo presupuesto descuentan sus viajes',
   PRIMARY KEY (id),
   UNIQUE KEY uq_usuarios_correo (correo),
   UNIQUE KEY uq_usuarios_rfc (rfc),
   KEY ix_usuarios_jefe (jefe_id),
-  CONSTRAINT fk_usuarios_rol  FOREIGN KEY (rol_id)  REFERENCES roles (id)    ON DELETE RESTRICT,
-  CONSTRAINT fk_usuarios_jefe FOREIGN KEY (jefe_id) REFERENCES usuarios (id) ON DELETE SET NULL
+  KEY ix_usuarios_depto (departamento_id),
+  CONSTRAINT fk_usuarios_rol   FOREIGN KEY (rol_id)          REFERENCES roles (id)         ON DELETE RESTRICT,
+  CONSTRAINT fk_usuarios_jefe  FOREIGN KEY (jefe_id)         REFERENCES usuarios (id)      ON DELETE SET NULL,
+  CONSTRAINT fk_usuarios_depto FOREIGN KEY (departamento_id) REFERENCES departamentos (id) ON DELETE RESTRICT
 ) ENGINE=InnoDB;
 
 CREATE TABLE prealtas (
@@ -181,17 +196,20 @@ CREATE TABLE solicitudes (
                      COMMENT 'Cerrado = autorizada y lista para comprobar',
   comprobante_viaje  VARCHAR(255)  NULL,
   nota_rechazo       TEXT          NULL,
+  departamento_id    INT           NULL COMMENT 'Departamento del solicitante al crear el folio (lo copia trg_solicitudes_bi); su presupuesto es el que descuenta',
   created_at         DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   PRIMARY KEY (id),
   UNIQUE KEY uq_solicitudes_folio (folio),
   KEY ix_solicitudes_user (user_id, created_at),
   KEY ix_solicitudes_estatus (estatus),
-  CONSTRAINT fk_solicitudes_usuario FOREIGN KEY (user_id) REFERENCES usuarios (id) ON DELETE RESTRICT
+  KEY ix_solicitudes_depto (departamento_id, estatus, fecha),
+  CONSTRAINT fk_solicitudes_usuario FOREIGN KEY (user_id)         REFERENCES usuarios (id)      ON DELETE RESTRICT,
+  CONSTRAINT fk_solicitudes_depto   FOREIGN KEY (departamento_id) REFERENCES departamentos (id) ON DELETE RESTRICT
 ) ENGINE=InnoDB;
 
 CREATE TABLE solicitud_destinos (
   id            VARCHAR(40)   NOT NULL,
-  solicitud_id  VARCHAR(40)   NOT NULL,
+  solicitud_id  VARCHAR(10)   NOT NULL COMMENT 'Folio de la solicitud (solicitudes.folio)',
   estado        VARCHAR(60)   NOT NULL,
   fecha_inicio  DATE          NOT NULL,
   fecha_fin     DATE          NOT NULL,
@@ -199,7 +217,7 @@ CREATE TABLE solicitud_destinos (
   caseta        DECIMAL(12,2) NOT NULL DEFAULT 0,
   PRIMARY KEY (id),
   KEY ix_destinos_solicitud (solicitud_id),
-  CONSTRAINT fk_destinos_solicitud FOREIGN KEY (solicitud_id) REFERENCES solicitudes (id) ON DELETE CASCADE
+  CONSTRAINT fk_destinos_solicitud FOREIGN KEY (solicitud_id) REFERENCES solicitudes (folio) ON DELETE CASCADE ON UPDATE CASCADE
 ) ENGINE=InnoDB;
 
 CREATE TABLE destino_hoteles (
@@ -240,37 +258,35 @@ CREATE TABLE destino_vales (
 ) ENGINE=InnoDB;
 
 CREATE TABLE autorizaciones (
-  id               VARCHAR(40) NOT NULL,
-  solicitud_id     VARCHAR(40) NOT NULL,
-  rol_autorizador  VARCHAR(60) NOT NULL COMMENT 'jefe_inmediato | finanzas',
-  user_id          VARCHAR(40) NOT NULL,
+  solicitud_id     VARCHAR(10)  NOT NULL COMMENT 'Folio de la solicitud (solicitudes.folio, p. ej. #0040)',
+  rol_autorizador  VARCHAR(60)  NOT NULL COMMENT 'jefe_inmediato | finanzas',
+  user_id          VARCHAR(40)  NOT NULL,
+  user_nombre      VARCHAR(120) NOT NULL COMMENT 'Nombre de user_id; lo mantienen sincronizado trg_autorizaciones_bi y trg_usuarios_au',
   status           ENUM('autorizado','rechazado') NOT NULL,
-  fecha            DATE        NOT NULL,
-  nota             TEXT        NULL,
-  PRIMARY KEY (id),
-  KEY ix_aut_solicitud (solicitud_id),
-  CONSTRAINT fk_aut_solicitud FOREIGN KEY (solicitud_id) REFERENCES solicitudes (id) ON DELETE CASCADE,
-  CONSTRAINT fk_aut_usuario   FOREIGN KEY (user_id)      REFERENCES usuarios (id)   ON DELETE RESTRICT
-) ENGINE=InnoDB;
+  fecha            DATE         NOT NULL,
+  nota             TEXT         NULL,
+  PRIMARY KEY (solicitud_id, user_id),
+  CONSTRAINT fk_aut_solicitud FOREIGN KEY (solicitud_id) REFERENCES solicitudes (folio) ON DELETE CASCADE ON UPDATE CASCADE,
+  CONSTRAINT fk_aut_usuario   FOREIGN KEY (user_id)      REFERENCES usuarios (id)       ON DELETE RESTRICT
+) ENGINE=InnoDB COMMENT='Una fila por decisión: la llave es folio + usuario que autorizó/rechazó';
 
 CREATE TABLE notas (
   id            VARCHAR(40) NOT NULL,
-  solicitud_id  VARCHAR(40) NOT NULL,
+  solicitud_id  VARCHAR(10) NOT NULL COMMENT 'Folio de la solicitud (solicitudes.folio)',
   user_id       VARCHAR(40) NULL,
   nota          TEXT        NOT NULL,
   created_at    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   PRIMARY KEY (id),
   KEY ix_notas_solicitud (solicitud_id),
-  CONSTRAINT fk_notas_solicitud FOREIGN KEY (solicitud_id) REFERENCES solicitudes (id) ON DELETE CASCADE,
+  CONSTRAINT fk_notas_solicitud FOREIGN KEY (solicitud_id) REFERENCES solicitudes (folio) ON DELETE CASCADE ON UPDATE CASCADE,
   CONSTRAINT fk_notas_usuario   FOREIGN KEY (user_id)      REFERENCES usuarios (id)   ON DELETE SET NULL
 ) ENGINE=InnoDB COMMENT='Reservada (ckl_notas)';
 
 -- Comprobación ------------------------------------------------------------
 CREATE TABLE comprobantes_gasto (
-  id                VARCHAR(40)   NOT NULL,
-  seq               BIGINT        NOT NULL AUTO_INCREMENT COMMENT 'Orden de captura de los renglones',
-  solicitud_id      VARCHAR(40)   NOT NULL,
+  solicitud_id      VARCHAR(10)   NOT NULL COMMENT 'Folio de la solicitud (solicitudes.folio, p. ej. #0040)',
   concepto          VARCHAR(60)   NOT NULL COMMENT 'Hotel, Avión, Uber, Comida, Vales, Caseta…',
+  seq               BIGINT        NOT NULL AUTO_INCREMENT COMMENT 'Orden de captura de los renglones',
   monto_solicitado  DECIMAL(12,2) NOT NULL DEFAULT 0,
   monto_comprobado  DECIMAL(12,2) NOT NULL DEFAULT 0,
   status_renglon    ENUM('comprobado','parcialmente_comprobado','pendiente','no_aplica') NOT NULL DEFAULT 'pendiente',
@@ -278,23 +294,22 @@ CREATE TABLE comprobantes_gasto (
   validado_por      VARCHAR(40)   NULL,
   validado_fecha    DATE          NULL,
   nota_validacion   TEXT          NULL,
-  PRIMARY KEY (id),
+  PRIMARY KEY (solicitud_id, concepto),
   UNIQUE KEY uq_cg_seq (seq),
-  KEY ix_cg_solicitud (solicitud_id),
-  CONSTRAINT fk_cg_solicitud FOREIGN KEY (solicitud_id) REFERENCES solicitudes (id) ON DELETE CASCADE,
-  CONSTRAINT fk_cg_validador FOREIGN KEY (validado_por) REFERENCES usuarios (id)    ON DELETE SET NULL
-) ENGINE=InnoDB;
+  CONSTRAINT fk_cg_solicitud FOREIGN KEY (solicitud_id) REFERENCES solicitudes (folio) ON DELETE CASCADE ON UPDATE CASCADE,
+  CONSTRAINT fk_cg_validador FOREIGN KEY (validado_por) REFERENCES usuarios (id)       ON DELETE SET NULL
+) ENGINE=InnoDB COMMENT='Un renglón por concepto de cada folio: la llave es folio + concepto';
 
 CREATE TABLE facturas (
   id              VARCHAR(40)   NOT NULL,
-  solicitud_id    VARCHAR(40)   NOT NULL,
+  solicitud_id    VARCHAR(10)   NOT NULL COMMENT 'Folio de la solicitud (solicitudes.folio)',
   tipo            ENUM('XML','PDF','FOTO') NOT NULL,
   fecha           DATE          NOT NULL,
   uuid            VARCHAR(60)   NOT NULL DEFAULT '',
   archivo         VARCHAR(255)  NOT NULL,
   total           DECIMAL(12,2) NOT NULL DEFAULT 0,
   status          ENUM('Verificado','Error','Incompleto') NOT NULL DEFAULT 'Verificado',
-  concepto_id     VARCHAR(40)   NULL COMMENT 'Renglón de comprobación al que se aplicó el monto',
+  concepto        VARCHAR(60)   NULL COMMENT 'Renglón de comprobación (solicitud_id + concepto) al que se aplicó el monto',
   monto_aplicado  DECIMAL(12,2) NOT NULL DEFAULT 0 COMMENT 'Solo el XML aplica monto; permite revertir exacto',
   par_id          VARCHAR(80)   NULL COMMENT 'Comparten par_id el XML y el PDF de un mismo comprobante',
   ruta            VARCHAR(500)  NULL COMMENT 'Archivo en almacenamiento externo: drive:<fileId> o local:<ruta>. NULL = el contenido está en factura_archivos',
@@ -306,9 +321,10 @@ CREATE TABLE facturas (
   PRIMARY KEY (id),
   UNIQUE KEY uq_facturas_uuid_xml (uuid_xml),
   KEY ix_facturas_solicitud (solicitud_id, par_id),
-  KEY ix_facturas_concepto (concepto_id),
-  CONSTRAINT fk_facturas_solicitud FOREIGN KEY (solicitud_id) REFERENCES solicitudes (id)        ON DELETE CASCADE,
-  CONSTRAINT fk_facturas_concepto  FOREIGN KEY (concepto_id)  REFERENCES comprobantes_gasto (id) ON DELETE SET NULL
+  KEY ix_facturas_renglon (solicitud_id, concepto),
+  CONSTRAINT fk_facturas_solicitud FOREIGN KEY (solicitud_id) REFERENCES solicitudes (folio) ON DELETE CASCADE ON UPDATE CASCADE,
+  CONSTRAINT fk_facturas_concepto  FOREIGN KEY (solicitud_id, concepto) REFERENCES comprobantes_gasto (solicitud_id, concepto)
+    ON DELETE CASCADE ON UPDATE CASCADE
 ) ENGINE=InnoDB;
 
 CREATE TABLE factura_archivos (
@@ -322,7 +338,7 @@ CREATE TABLE factura_archivos (
 -- Depósito sobrante: fichas de depósito del sobrante de viáticos. Suman al comprobado del folio (aún sin SAP).
 CREATE TABLE depositos_sobrante (
   id            VARCHAR(40)   NOT NULL,
-  solicitud_id  VARCHAR(40)   NOT NULL,
+  solicitud_id  VARCHAR(10)   NOT NULL COMMENT 'Folio de la solicitud (solicitudes.folio)',
   monto         DECIMAL(12,2) NOT NULL,
   archivo       VARCHAR(255)  NOT NULL,
   ruta          VARCHAR(500)  NULL COMMENT 'Archivo en almacenamiento externo: drive:<fileId> o local:<ruta>. NULL = el contenido está en deposito_archivos',
@@ -330,7 +346,7 @@ CREATE TABLE depositos_sobrante (
   created_at    DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   PRIMARY KEY (id),
   KEY ix_depositos_solicitud (solicitud_id),
-  CONSTRAINT fk_dep_solicitud FOREIGN KEY (solicitud_id) REFERENCES solicitudes (id) ON DELETE CASCADE,
+  CONSTRAINT fk_dep_solicitud FOREIGN KEY (solicitud_id) REFERENCES solicitudes (folio) ON DELETE CASCADE ON UPDATE CASCADE,
   CONSTRAINT fk_dep_usuario   FOREIGN KEY (creado_por)   REFERENCES usuarios (id)    ON DELETE SET NULL
 ) ENGINE=InnoDB COMMENT='Fichas de depósito del sobrante de viáticos; suman al comprobado del folio';
 
@@ -358,7 +374,7 @@ CREATE TABLE factura_desglose (
 
 CREATE TABLE contabilizaciones (
   id             VARCHAR(40)  NOT NULL,
-  solicitud_id   VARCHAR(40)  NOT NULL,
+  solicitud_id   VARCHAR(10)  NOT NULL COMMENT 'Folio de la solicitud (solicitudes.folio)',
   referencia     VARCHAR(40)  NOT NULL COMMENT 'Folio como texto, sin "#": llave de idempotencia en SAP',
   estado         ENUM('enviando','enviado','error','cancelada') NOT NULL DEFAULT 'enviando',
   modo           VARCHAR(10)  NOT NULL DEFAULT 'simulado' COMMENT 'simulado | real',
@@ -373,7 +389,7 @@ CREATE TABLE contabilizaciones (
   updated_at     DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   PRIMARY KEY (id),
   UNIQUE KEY uq_contab_solicitud (solicitud_id),
-  CONSTRAINT fk_contab_solicitud FOREIGN KEY (solicitud_id) REFERENCES solicitudes (id) ON DELETE CASCADE,
+  CONSTRAINT fk_contab_solicitud FOREIGN KEY (solicitud_id) REFERENCES solicitudes (folio) ON DELETE CASCADE ON UPDATE CASCADE,
   CONSTRAINT fk_contab_usuario   FOREIGN KEY (creado_por)   REFERENCES usuarios (id)    ON DELETE SET NULL
 ) ENGINE=InnoDB COMMENT='Envío a SAP del asiento de un viaje al compensarlo';
 
@@ -408,7 +424,7 @@ CREATE TABLE convenios (
 
 CREATE TABLE revisiones_monto (
   id               VARCHAR(40)   NOT NULL,
-  solicitud_id     VARCHAR(40)   NOT NULL,
+  solicitud_id     VARCHAR(10)   NOT NULL COMMENT 'Folio de la solicitud (solicitudes.folio)',
   folio            VARCHAR(10)   NOT NULL,
   user_id          VARCHAR(40)   NOT NULL COMMENT 'Quien solicitó',
   destino_estado   VARCHAR(60)   NOT NULL DEFAULT '',
@@ -431,8 +447,8 @@ CREATE TABLE revisiones_monto (
   PRIMARY KEY (id),
   KEY ix_rev_solicitud (solicitud_id, vigente),
   KEY ix_rev_estado (estado),
-  CONSTRAINT fk_rev_solicitud FOREIGN KEY (solicitud_id) REFERENCES solicitudes (id) ON DELETE CASCADE,
-  CONSTRAINT fk_rev_hotel     FOREIGN KEY (hotel_id)     REFERENCES hoteles (id)     ON DELETE SET NULL
+  CONSTRAINT fk_rev_solicitud FOREIGN KEY (solicitud_id) REFERENCES solicitudes (folio) ON DELETE CASCADE ON UPDATE CASCADE,
+  CONSTRAINT fk_rev_hotel     FOREIGN KEY (hotel_id)     REFERENCES hoteles (id)        ON DELETE SET NULL
 ) ENGINE=InnoDB;
 
 -- Cierre de un viaje por Finanzas/Compras (permiso compensar_viaje) cuando ya está comprobado al 100 % y
@@ -440,7 +456,7 @@ CREATE TABLE revisiones_monto (
 -- solicitado). Un folio compensado ya no admite cambios en sus facturas y sale de las vistas por omisión.
 CREATE TABLE compensaciones (
   id               VARCHAR(40)   NOT NULL,
-  solicitud_id     VARCHAR(40)   NOT NULL,
+  solicitud_id     VARCHAR(10)   NOT NULL COMMENT 'Folio de la solicitud (solicitudes.folio)',
   decision         ENUM('reembolsar','no_reembolsar','sin_excedente') NOT NULL,
   monto_solicitado DECIMAL(12,2) NOT NULL COMMENT 'Fotografía al compensar',
   monto_comprobado DECIMAL(12,2) NOT NULL COMMENT 'Lo aplicado a los renglones (tope = solicitado)',
@@ -451,7 +467,27 @@ CREATE TABLE compensaciones (
   compensado_at    DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   PRIMARY KEY (id),
   UNIQUE KEY uq_compensacion_solicitud (solicitud_id),
-  CONSTRAINT fk_comp_solicitud FOREIGN KEY (solicitud_id) REFERENCES solicitudes (id) ON DELETE CASCADE
+  CONSTRAINT fk_comp_solicitud FOREIGN KEY (solicitud_id) REFERENCES solicitudes (folio) ON DELETE CASCADE ON UPDATE CASCADE
+) ENGINE=InnoDB;
+
+-- Bolsas de presupuesto por departamento (Admin/Finanzas, permiso gestionar_presupuestos). Por omisión una por
+-- mes, pero el rango de fechas es libre (Finanzas puede renovarla cuando lo necesite). Los periodos de un mismo
+-- departamento no se empalman (trg_presupuestos_bi/bu), así cada folio cae en una sola bolsa: la que cubre su
+-- fecha de solicitud. Lo ejercido NO se guarda: lo calcula v_presupuestos con los folios autorizados (Cerrado),
+-- así una reversión o un rechazo regresan el monto solos.
+CREATE TABLE presupuestos (
+  id               VARCHAR(40)   NOT NULL,
+  departamento_id  INT           NOT NULL,
+  fecha_inicio     DATE          NOT NULL,
+  fecha_fin        DATE          NOT NULL,
+  monto            DECIMAL(12,2) NOT NULL COMMENT 'Monto asignado a la bolsa',
+  notas            VARCHAR(500)  NULL,
+  creado_por       VARCHAR(40)   NULL,
+  creado_at        DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  actualizado_at   DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (id),
+  KEY ix_presupuestos_depto (departamento_id, fecha_inicio, fecha_fin),
+  CONSTRAINT fk_presupuestos_depto FOREIGN KEY (departamento_id) REFERENCES departamentos (id) ON DELETE RESTRICT
 ) ENGINE=InnoDB;
 
 CREATE TABLE correos (
@@ -491,9 +527,17 @@ INSERT INTO roles (id, nombre, permisos) VALUES
   (1, 'usuario', '{"solicitar":true,"ver_propio":true,"comprobar":true,"ver_equipo":false,"ver_todo":false,"autorizar_lte5000":false,"autorizar_gt5000":false,"rechazar":false,"subir_comprobantes_viaje":false,"ver_reportes":false,"exportar_reportes":false,"gestionar_usuarios":false,"configurar_permisos":false,"configurar_montos":false}'),
   (2, 'jefe_inmediato', '{"solicitar":true,"ver_propio":true,"comprobar":false,"ver_equipo":true,"ver_todo":false,"autorizar_lte5000":true,"autorizar_gt5000":false,"rechazar":true,"subir_comprobantes_viaje":false,"ver_reportes":true,"exportar_reportes":false,"gestionar_usuarios":false,"configurar_permisos":false,"configurar_montos":false}'),
   (3, 'gestor_vuelos', '{"solicitar":false,"ver_propio":false,"comprobar":true,"ver_equipo":false,"ver_todo":true,"autorizar_lte5000":false,"autorizar_gt5000":false,"rechazar":false,"subir_comprobantes_viaje":true,"ver_reportes":false,"exportar_reportes":false,"gestionar_usuarios":false,"configurar_permisos":false,"configurar_montos":false}'),
-  (4, 'finanzas', '{"compensar_viaje":true,"solicitar":true,"ver_propio":true,"comprobar":false,"ver_equipo":false,"ver_todo":true,"autorizar_lte5000":false,"autorizar_gt5000":true,"rechazar":true,"subir_comprobantes_viaje":false,"ver_reportes":true,"exportar_reportes":true,"gestionar_usuarios":false,"configurar_permisos":false,"configurar_montos":false,"ver_gasto_por_concepto":true}'),
-  (5, 'administrador', '{"solicitar":true,"ver_propio":true,"comprobar":true,"ver_equipo":true,"ver_todo":true,"autorizar_lte5000":true,"autorizar_gt5000":true,"rechazar":true,"subir_comprobantes_viaje":true,"ver_reportes":true,"exportar_reportes":true,"gestionar_usuarios":true,"configurar_permisos":true,"configurar_montos":true,"ver_gasto_por_concepto":true}'),
+  (4, 'finanzas', '{"compensar_viaje":true,"solicitar":true,"ver_propio":true,"comprobar":false,"ver_equipo":false,"ver_todo":true,"autorizar_lte5000":false,"autorizar_gt5000":true,"rechazar":true,"subir_comprobantes_viaje":false,"ver_reportes":true,"exportar_reportes":true,"gestionar_usuarios":false,"configurar_permisos":false,"configurar_montos":false,"ver_gasto_por_concepto":true,"gestionar_presupuestos":true}'),
+  (5, 'administrador', '{"solicitar":true,"ver_propio":true,"comprobar":true,"ver_equipo":true,"ver_todo":true,"autorizar_lte5000":true,"autorizar_gt5000":true,"rechazar":true,"subir_comprobantes_viaje":true,"ver_reportes":true,"exportar_reportes":true,"gestionar_usuarios":true,"configurar_permisos":true,"configurar_montos":true,"ver_gasto_por_concepto":true,"gestionar_presupuestos":true}'),
   (6, 'compras_corporativas', '{"compensar_viaje":true,"validar_comprobacion":true,"revisar_monto_manual":true,"gestionar_convenios":true,"solicitar":true,"ver_propio":true,"comprobar":false,"ver_equipo":false,"ver_todo":true,"autorizar_lte5000":false,"autorizar_gt5000":true,"rechazar":true,"subir_comprobantes_viaje":false,"ver_reportes":true,"exportar_reportes":true,"gestionar_usuarios":false,"configurar_permisos":false,"configurar_montos":false,"ver_gasto_por_concepto":true}');
+
+-- departamentos (los de la columna "Depto o sucursal" de la hoja de pagos a hoteles)
+INSERT INTO departamentos (id, nombre) VALUES
+  (1, 'Comercial'),
+  (2, 'Auditoría'),
+  (3, 'Calidad'),
+  (4, 'Apoyo'),
+  (5, 'Movilidad');
 
 -- sociedades
 INSERT INTO sociedades (id, nombre, rfc, regimen, cp, uso_cfdi, sociedad_sap) VALUES
@@ -614,6 +658,8 @@ INSERT INTO configuracion (clave, valor) VALUES
   ('sap_contabilizacion_activa', 'false'),
   ('sap_modo', '"simulado"'),
   ('sap_cuentas', '{}'),
+  -- Presupuestos por departamento: true = no se autoriza un folio que exceda el disponible de su bolsa.
+  ('bloquear_autorizacion_sin_presupuesto', 'false'),
   -- Palabras que rechazan una factura al subirla (Configuración → Productos no permitidos en facturas).
   ('palabras_prohibidas_alcohol', '["cerveza","vino","tequila","mezcal","whisky","whiskey","ron","vodka","ginebra","brandy","coñac","cognac","licor","sidra","champagne","champaña","aguardiente","bacardi","destilado"]'),
   ('palabras_prohibidas_tabaco', '["cigarro","cigarrillo","cigarrillos","vape","vapeador","tabaco","puro","nicotina","habano"]'),
@@ -664,32 +710,32 @@ INSERT INTO solicitudes (id, folio, user_id, fecha, empresa, origen, destino_res
 
 -- destinos
 INSERT INTO solicitud_destinos (id, solicitud_id, estado, fecha_inicio, fecha_fin, gasolina, caseta) VALUES
-  ('dd_s1', 's1', 'Guanajuato', '2026-05-23', '2026-05-28', 0, 0),
-  ('dd_s2', 's2', 'CDMX', '2026-05-17', '2026-05-19', 0, 0),
-  ('dd_s3', 's3', 'Colima', '2026-05-05', '2026-05-07', 0, 0),
-  ('dd_s4', 's4', 'Zacatecas', '2026-04-28', '2026-05-02', 0, 0),
-  ('dd_s5', 's5', 'Nuevo León', '2026-04-13', '2026-04-15', 0, 0),
-  ('dd_s6', 's6', 'Querétaro', '2026-04-04', '2026-04-05', 0, 0),
-  ('dd_s7', 's7', 'Nuevo León', '2026-08-23', '2026-08-26', 0, 0),
-  ('dd_s8', 's8', 'Colima', '2026-08-28', '2026-08-30', 0, 0),
-  ('dd_s9', 's9', 'CDMX', '2026-08-31', '2026-09-02', 0, 0),
-  ('dd_s10', 's10', 'Querétaro', '2026-09-04', '2026-09-06', 0, 0),
-  ('dd_s11', 's11', 'Colima', '2026-09-06', '2026-09-07', 0, 0),
-  ('dd_s12', 's12', 'Zacatecas', '2026-09-13', '2026-09-16', 0, 0),
-  ('dd_s13', 's13', 'CDMX', '2026-09-08', '2026-09-09', 0, 0),
-  ('dd_s14', 's14', 'Nuevo León', '2026-09-15', '2026-09-17', 0, 0),
-  ('dd_s15', 's15', 'Querétaro', '2026-09-17', '2026-09-18', 0, 0),
-  ('dd_s16', 's16', 'Zacatecas', '2026-09-19', '2026-09-21', 0, 0),
-  ('dd_s17', 's17', 'Nuevo León', '2026-09-20', '2026-09-22', 0, 0),
-  ('dd_s18', 's18', 'CDMX', '2026-09-21', '2026-09-23', 0, 0),
-  ('dd_s19', 's19', 'Guanajuato', '2026-09-28', '2026-09-30', 0, 0),
-  ('dd_s20', 's20', 'Nuevo León', '2026-10-05', '2026-10-07', 0, 0),
-  ('dd_s21', 's21', 'Zacatecas', '2026-10-12', '2026-10-14', 0, 0),
-  ('dd_s22', 's22', 'Nuevo León', '2026-11-09', '2026-11-12', 0, 0),
-  ('dd_s23', 's23', 'Zacatecas', '2026-11-16', '2026-11-19', 0, 0),
-  ('dd_s26', 's26', 'Querétaro', '2026-11-04', '2026-11-06', 0, 0),
-  ('dd_s24', 's24', 'CDMX', '2026-11-02', '2026-11-04', 0, 0),
-  ('dd_s25', 's25', 'Guanajuato', '2026-11-23', '2026-11-26', 0, 0);
+  ('dd_s1', '#0041', 'Guanajuato', '2026-05-23', '2026-05-28', 0, 0),
+  ('dd_s2', '#0040', 'CDMX', '2026-05-17', '2026-05-19', 0, 0),
+  ('dd_s3', '#0039', 'Colima', '2026-05-05', '2026-05-07', 0, 0),
+  ('dd_s4', '#0038', 'Zacatecas', '2026-04-28', '2026-05-02', 0, 0),
+  ('dd_s5', '#0037', 'Nuevo León', '2026-04-13', '2026-04-15', 0, 0),
+  ('dd_s6', '#0036', 'Querétaro', '2026-04-04', '2026-04-05', 0, 0),
+  ('dd_s7', '#0042', 'Nuevo León', '2026-08-23', '2026-08-26', 0, 0),
+  ('dd_s8', '#0043', 'Colima', '2026-08-28', '2026-08-30', 0, 0),
+  ('dd_s9', '#0044', 'CDMX', '2026-08-31', '2026-09-02', 0, 0),
+  ('dd_s10', '#0045', 'Querétaro', '2026-09-04', '2026-09-06', 0, 0),
+  ('dd_s11', '#0046', 'Colima', '2026-09-06', '2026-09-07', 0, 0),
+  ('dd_s12', '#0047', 'Zacatecas', '2026-09-13', '2026-09-16', 0, 0),
+  ('dd_s13', '#0048', 'CDMX', '2026-09-08', '2026-09-09', 0, 0),
+  ('dd_s14', '#0049', 'Nuevo León', '2026-09-15', '2026-09-17', 0, 0),
+  ('dd_s15', '#0050', 'Querétaro', '2026-09-17', '2026-09-18', 0, 0),
+  ('dd_s16', '#0060', 'Zacatecas', '2026-09-19', '2026-09-21', 0, 0),
+  ('dd_s17', '#0061', 'Nuevo León', '2026-09-20', '2026-09-22', 0, 0),
+  ('dd_s18', '#0062', 'CDMX', '2026-09-21', '2026-09-23', 0, 0),
+  ('dd_s19', '#0063', 'Guanajuato', '2026-09-28', '2026-09-30', 0, 0),
+  ('dd_s20', '#0064', 'Nuevo León', '2026-10-05', '2026-10-07', 0, 0),
+  ('dd_s21', '#0065', 'Zacatecas', '2026-10-12', '2026-10-14', 0, 0),
+  ('dd_s22', '#0066', 'Nuevo León', '2026-11-09', '2026-11-12', 0, 0),
+  ('dd_s23', '#0067', 'Zacatecas', '2026-11-16', '2026-11-19', 0, 0),
+  ('dd_s26', '#0068', 'Querétaro', '2026-11-04', '2026-11-06', 0, 0),
+  ('dd_s24', '#0069', 'CDMX', '2026-11-02', '2026-11-04', 0, 0),
+  ('dd_s25', '#0070', 'Guanajuato', '2026-11-23', '2026-11-26', 0, 0);
 
 -- hoteles por destino
 INSERT INTO destino_hoteles (id, destino_id, hotel_id, fecha_inicio, fecha_fin, monto, manual, tipo_habitacion, motivo_cambio) VALUES
@@ -801,189 +847,189 @@ INSERT INTO destino_vales (id, destino_id, concepto, monto) VALUES
   ('ro_s21', 'dd_s21', 'Imprevistos', 150);
 
 -- autorizaciones
-INSERT INTO autorizaciones (id, solicitud_id, rol_autorizador, user_id, status, fecha, nota) VALUES
-  ('a1', 's2', 'jefe_inmediato', 'u2', 'autorizado', '2026-05-15', ''),
-  ('a2', 's2', 'finanzas', 'u4', 'autorizado', '2026-05-16', ''),
-  ('a3', 's3', 'jefe_inmediato', 'u2', 'autorizado', '2026-05-03', ''),
-  ('a4', 's3', 'finanzas', 'u4', 'rechazado', '2026-05-04', 'Monto de hotel no corresponde a tarifa acordada.'),
-  ('a5', 's4', 'jefe_inmediato', 'u2', 'autorizado', '2026-04-26', ''),
-  ('a6', 's4', 'finanzas', 'u4', 'autorizado', '2026-04-27', ''),
-  ('a7', 's6', 'jefe_inmediato', 'u2', 'autorizado', '2026-04-02', ''),
-  ('a8', 's10', 'jefe_inmediato', 'u2', 'autorizado', '2026-09-02', ''),
-  ('a9', 's11', 'jefe_inmediato', 'u2', 'rechazado', '2026-09-04', 'Motivo de viaje insuficientemente justificado.'),
-  ('a10', 's13', 'jefe_inmediato', 'u2', 'autorizado', '2026-09-06', ''),
-  ('a11', 's15', 'jefe_inmediato', 'u2', 'autorizado', '2026-09-15', ''),
-  ('a12', 's16', 'jefe_inmediato', 'u2', 'autorizado', '2026-09-17', ''),
-  ('a13', 's17', 'jefe_inmediato', 'u2', 'autorizado', '2026-09-18', ''),
-  ('a14', 's17', 'finanzas', 'u4', 'autorizado', '2026-09-18', ''),
-  ('a15', 's18', 'jefe_inmediato', 'u2', 'autorizado', '2026-09-19', ''),
-  ('av_s19_j', 's19', 'jefe_inmediato', 'u2', 'autorizado', '2026-09-24', ''),
-  ('av_s20_j', 's20', 'jefe_inmediato', 'u2', 'autorizado', '2026-10-02', ''),
-  ('av_s20_f', 's20', 'finanzas', 'u4', 'autorizado', '2026-10-02', ''),
-  ('av_s21_j', 's21', 'jefe_inmediato', 'u2', 'autorizado', '2026-10-08', '');
+INSERT INTO autorizaciones (solicitud_id, rol_autorizador, user_id, user_nombre, status, fecha, nota) VALUES
+  ('#0040', 'jefe_inmediato', 'u2', 'Juan Alvarado', 'autorizado', '2026-05-15', ''),
+  ('#0040', 'finanzas', 'u4', 'Luis Vega', 'autorizado', '2026-05-16', ''),
+  ('#0039', 'jefe_inmediato', 'u2', 'Juan Alvarado', 'autorizado', '2026-05-03', ''),
+  ('#0039', 'finanzas', 'u4', 'Luis Vega', 'rechazado', '2026-05-04', 'Monto de hotel no corresponde a tarifa acordada.'),
+  ('#0038', 'jefe_inmediato', 'u2', 'Juan Alvarado', 'autorizado', '2026-04-26', ''),
+  ('#0038', 'finanzas', 'u4', 'Luis Vega', 'autorizado', '2026-04-27', ''),
+  ('#0036', 'jefe_inmediato', 'u2', 'Juan Alvarado', 'autorizado', '2026-04-02', ''),
+  ('#0045', 'jefe_inmediato', 'u2', 'Juan Alvarado', 'autorizado', '2026-09-02', ''),
+  ('#0046', 'jefe_inmediato', 'u2', 'Juan Alvarado', 'rechazado', '2026-09-04', 'Motivo de viaje insuficientemente justificado.'),
+  ('#0048', 'jefe_inmediato', 'u2', 'Juan Alvarado', 'autorizado', '2026-09-06', ''),
+  ('#0050', 'jefe_inmediato', 'u2', 'Juan Alvarado', 'autorizado', '2026-09-15', ''),
+  ('#0060', 'jefe_inmediato', 'u2', 'Juan Alvarado', 'autorizado', '2026-09-17', ''),
+  ('#0061', 'jefe_inmediato', 'u2', 'Juan Alvarado', 'autorizado', '2026-09-18', ''),
+  ('#0061', 'finanzas', 'u4', 'Luis Vega', 'autorizado', '2026-09-18', ''),
+  ('#0062', 'jefe_inmediato', 'u2', 'Juan Alvarado', 'autorizado', '2026-09-19', ''),
+  ('#0063', 'jefe_inmediato', 'u2', 'Juan Alvarado', 'autorizado', '2026-09-24', ''),
+  ('#0064', 'jefe_inmediato', 'u2', 'Juan Alvarado', 'autorizado', '2026-10-02', ''),
+  ('#0064', 'finanzas', 'u4', 'Luis Vega', 'autorizado', '2026-10-02', ''),
+  ('#0065', 'jefe_inmediato', 'u2', 'Juan Alvarado', 'autorizado', '2026-10-08', '');
 
 -- renglones de comprobación
-INSERT INTO comprobantes_gasto (id, solicitud_id, concepto, monto_solicitado, monto_comprobado, status_renglon, validado, validado_por, validado_fecha, nota_validacion) VALUES
-  ('cg1', 's2', 'Hotel', 1600, 1600, 'comprobado', 0, NULL, NULL, NULL),
-  ('cg_6ppn5efa', 's2', 'Avión', 1800, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg_d6vgtkv2', 's2', 'Uber', 400, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg4', 's2', 'Comida', 900, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg5', 's2', 'Vales', 500, 500, 'comprobado', 0, NULL, NULL, NULL),
-  ('cg6', 's10', 'Hotel', 1600, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg_mtkmmihc', 's10', 'Autobús', 1400, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg_hwgmrvli', 's10', 'Uber', 300, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg9', 's10', 'Comida', 900, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg10', 's10', 'Vales', 300, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s1_1', 's1', 'Hotel', 3100, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg_kzphalks', 's1', 'Autobús', 2254, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg_r8gw43kq', 's1', 'Uber', 773, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s1_4', 's1', 'Comida', 1610, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s1_5', 's1', 'Vales', 313, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s3_1', 's3', 'Hotel', 1200, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg_ec91vlf8', 's3', 'Autobús', 500, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg_r0c4pq6e', 's3', 'Uber', 200, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s3_4', 's3', 'Comida', 500, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s3_5', 's3', 'Vales', 100, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s4_1', 's4', 'Hotel', 3560, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg_smczpvw8', 's4', 'Autobús', 2800, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg_xdv9xf66', 's4', 'Uber', 960, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s4_4', 's4', 'Comida', 2000, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s4_5', 's4', 'Vales', 680, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s5_1', 's5', 'Hotel', 1900, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg_fiqbklhh', 's5', 'Avión', 1344, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg_6jxstc8p', 's5', 'Uber', 461, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s5_4', 's5', 'Comida', 960, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s5_5', 's5', 'Vales', 135, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s6_1', 's6', 'Hotel', 760, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg_zxkw7p02', 's6', 'Autobús', 868, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg_b1jae60b', 's6', 'Uber', 298, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s6_4', 's6', 'Comida', 620, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s6_5', 's6', 'Vales', 554, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s7_1', 's7', 'Hotel', 2850, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg_zkuksnqs', 's7', 'Avión', 2016, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg_1tbn7lyz', 's7', 'Uber', 691, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s7_4', 's7', 'Comida', 1440, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s7_5', 's7', 'Vales', 203, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s8_1', 's8', 'Hotel', 1100, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg_1jnud1s6', 's8', 'Autobús', 896, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg_asaojo1z', 's8', 'Uber', 307, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s8_4', 's8', 'Comida', 640, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s8_5', 's8', 'Vales', 257, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s9_1', 's9', 'Hotel', 2200, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg_d0kdsghv', 's9', 'Avión', 1708, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg_a9ri1ue4', 's9', 'Uber', 586, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s9_4', 's9', 'Comida', 1220, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s9_5', 's9', 'Vales', 386, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s11_1', 's11', 'Hotel', 550, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg_3gv220cx', 's11', 'Autobús', 588, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg_bzwlgldk', 's11', 'Uber', 202, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s11_4', 's11', 'Comida', 420, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s11_5', 's11', 'Vales', 340, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s12_1', 's12', 'Hotel', 2670, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg_gbqxw155', 's12', 'Autobús', 1792, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg_i78uxlko', 's12', 'Uber', 614, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s12_4', 's12', 'Comida', 1280, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s12_5', 's12', 'Vales', 44, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s13_1', 's13', 'Hotel', 1100, 1100, 'comprobado', 0, NULL, NULL, NULL),
-  ('cg_q7vby10p', 's13', 'Avión', 1176, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg_hnieebz4', 's13', 'Uber', 403, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s13_4', 's13', 'Comida', 840, 840, 'comprobado', 0, NULL, NULL, NULL),
-  ('cgd_s13_5', 's13', 'Vales', 681, 681, 'comprobado', 0, NULL, NULL, NULL),
-  ('cgd_s14_1', 's14', 'Hotel', 1900, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg_7yilbifg', 's14', 'Avión', 1624, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg_2mclrbr2', 's14', 'Uber', 557, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s14_4', 's14', 'Comida', 1160, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s14_5', 's14', 'Vales', 559, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s15_1', 's15', 'Hotel', 870, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg_5ha0j1b0', 's15', 'Autobús', 868, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg_kox3rteh', 's15', 'Uber', 298, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s15_4', 's15', 'Comida', 620, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s15_5', 's15', 'Vales', 444, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s16_1', 's16', 'Hotel', 1780, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg_u8x61iz5', 's16', 'Autobús', 1288, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg_odjoz6cv', 's16', 'Uber', 442, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s16_4', 's16', 'Comida', 920, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s16_5', 's16', 'Vales', 170, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s17_1', 's17', 'Hotel', 2300, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg_xhhlpbvi', 's17', 'Avión', 1904, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg_8d54yu16', 's17', 'Uber', 653, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s17_4', 's17', 'Comida', 1360, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s17_5', 's17', 'Vales', 583, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s18_1', 's18', 'Hotel', 1360, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg_aslj0vo5', 's18', 'Avión', 1092, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cg_h7jv8yl8', 's18', 'Uber', 374, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s18_4', 's18', 'Comida', 780, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgd_s18_5', 's18', 'Vales', 294, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgv_s19_1', 's19', 'Hotel', 1580, 1580, 'comprobado', 0, NULL, NULL, NULL),
-  ('cgv_s19_2', 's19', 'Autobús', 600, 600, 'comprobado', 0, NULL, NULL, NULL),
-  ('cgv_s19_3', 's19', 'Uber', 300, 300, 'comprobado', 0, NULL, NULL, NULL),
-  ('cgv_s19_4', 's19', 'Comida', 1350, 1350, 'comprobado', 0, NULL, NULL, NULL),
-  ('cgv_s19_5', 's19', 'Vales', 200, 200, 'comprobado', 0, NULL, NULL, NULL),
-  ('cgv_s20_1', 's20', 'Hotel', 1900, 1900, 'comprobado', 1, 'u6', '2026-10-20', NULL),
-  ('cgv_s20_2', 's20', 'Avión', 1600, 1600, 'comprobado', 1, 'u6', '2026-10-20', NULL),
-  ('cgv_s20_3', 's20', 'Uber', 450, 450, 'comprobado', 1, 'u6', '2026-10-20', NULL),
-  ('cgv_s20_4', 's20', 'Comida', 1350, 1350, 'comprobado', 1, 'u6', '2026-10-20', NULL),
-  ('cgv_s20_5', 's20', 'Vales', 250, 250, 'comprobado', 1, 'u6', '2026-10-20', NULL),
-  ('cgv_s21_1', 's21', 'Hotel', 1780, 1780, 'comprobado', 1, 'u6', '2026-10-20', NULL),
-  ('cgv_s21_2', 's21', 'Autobús', 1100, 1100, 'comprobado', 1, 'u6', '2026-10-20', NULL),
-  ('cgv_s21_3', 's21', 'Uber', 380, 380, 'comprobado', 1, 'u6', '2026-10-20', NULL),
-  ('cgv_s21_4', 's21', 'Comida', 1350, 1350, 'comprobado', 0, NULL, NULL, 'El RFC del receptor de esta factura no coincide con la sociedad; solicitar factura corregida.'),
-  ('cgv_s21_5', 's21', 'Vales', 150, 150, 'comprobado', 0, NULL, NULL, NULL),
-  ('cgm_s22_1', 's22', 'Hotel', 5100, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgm_s22_2', 's22', 'Avión', 1800, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgm_s22_3', 's22', 'Uber', 500, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgm_s22_4', 's22', 'Comida', 1800, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgm_s22_5', 's22', 'Vales', 0, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgm_s23_1', 's23', 'Hotel', 3060, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgm_s23_2', 's23', 'Autobús', 1100, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgm_s23_3', 's23', 'Uber', 380, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgm_s23_4', 's23', 'Comida', 1800, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgm_s23_5', 's23', 'Vales', 0, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgm_s26_1', 's26', 'Hotel', 2200, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgm_s26_2', 's26', 'Autobús', 700, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgm_s26_3', 's26', 'Uber', 250, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgm_s26_4', 's26', 'Comida', 1350, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgm_s26_5', 's26', 'Vales', 0, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgm_s24_1', 's24', 'Hotel', 4800, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgm_s24_2', 's24', 'Avión', 1900, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgm_s24_3', 's24', 'Uber', 420, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgm_s24_4', 's24', 'Comida', 1350, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgm_s24_5', 's24', 'Vales', 0, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgm_s25_1', 's25', 'Hotel', 4500, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgm_s25_2', 's25', 'Autobús', 650, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgm_s25_3', 's25', 'Uber', 300, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgm_s25_4', 's25', 'Comida', 1800, 0, 'pendiente', 0, NULL, NULL, NULL),
-  ('cgm_s25_5', 's25', 'Vales', 0, 0, 'pendiente', 0, NULL, NULL, NULL);
+INSERT INTO comprobantes_gasto (solicitud_id, concepto, monto_solicitado, monto_comprobado, status_renglon, validado, validado_por, validado_fecha, nota_validacion) VALUES
+  ('#0040', 'Hotel', 1600, 1600, 'comprobado', 0, NULL, NULL, NULL),
+  ('#0040', 'Avión', 1800, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0040', 'Uber', 400, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0040', 'Comida', 900, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0040', 'Vales', 500, 500, 'comprobado', 0, NULL, NULL, NULL),
+  ('#0045', 'Hotel', 1600, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0045', 'Autobús', 1400, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0045', 'Uber', 300, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0045', 'Comida', 900, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0045', 'Vales', 300, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0041', 'Hotel', 3100, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0041', 'Autobús', 2254, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0041', 'Uber', 773, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0041', 'Comida', 1610, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0041', 'Vales', 313, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0039', 'Hotel', 1200, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0039', 'Autobús', 500, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0039', 'Uber', 200, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0039', 'Comida', 500, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0039', 'Vales', 100, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0038', 'Hotel', 3560, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0038', 'Autobús', 2800, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0038', 'Uber', 960, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0038', 'Comida', 2000, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0038', 'Vales', 680, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0037', 'Hotel', 1900, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0037', 'Avión', 1344, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0037', 'Uber', 461, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0037', 'Comida', 960, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0037', 'Vales', 135, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0036', 'Hotel', 760, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0036', 'Autobús', 868, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0036', 'Uber', 298, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0036', 'Comida', 620, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0036', 'Vales', 554, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0042', 'Hotel', 2850, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0042', 'Avión', 2016, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0042', 'Uber', 691, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0042', 'Comida', 1440, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0042', 'Vales', 203, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0043', 'Hotel', 1100, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0043', 'Autobús', 896, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0043', 'Uber', 307, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0043', 'Comida', 640, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0043', 'Vales', 257, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0044', 'Hotel', 2200, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0044', 'Avión', 1708, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0044', 'Uber', 586, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0044', 'Comida', 1220, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0044', 'Vales', 386, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0046', 'Hotel', 550, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0046', 'Autobús', 588, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0046', 'Uber', 202, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0046', 'Comida', 420, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0046', 'Vales', 340, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0047', 'Hotel', 2670, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0047', 'Autobús', 1792, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0047', 'Uber', 614, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0047', 'Comida', 1280, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0047', 'Vales', 44, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0048', 'Hotel', 1100, 1100, 'comprobado', 0, NULL, NULL, NULL),
+  ('#0048', 'Avión', 1176, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0048', 'Uber', 403, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0048', 'Comida', 840, 840, 'comprobado', 0, NULL, NULL, NULL),
+  ('#0048', 'Vales', 681, 681, 'comprobado', 0, NULL, NULL, NULL),
+  ('#0049', 'Hotel', 1900, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0049', 'Avión', 1624, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0049', 'Uber', 557, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0049', 'Comida', 1160, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0049', 'Vales', 559, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0050', 'Hotel', 870, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0050', 'Autobús', 868, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0050', 'Uber', 298, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0050', 'Comida', 620, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0050', 'Vales', 444, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0060', 'Hotel', 1780, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0060', 'Autobús', 1288, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0060', 'Uber', 442, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0060', 'Comida', 920, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0060', 'Vales', 170, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0061', 'Hotel', 2300, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0061', 'Avión', 1904, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0061', 'Uber', 653, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0061', 'Comida', 1360, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0061', 'Vales', 583, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0062', 'Hotel', 1360, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0062', 'Avión', 1092, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0062', 'Uber', 374, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0062', 'Comida', 780, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0062', 'Vales', 294, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0063', 'Hotel', 1580, 1580, 'comprobado', 0, NULL, NULL, NULL),
+  ('#0063', 'Autobús', 600, 600, 'comprobado', 0, NULL, NULL, NULL),
+  ('#0063', 'Uber', 300, 300, 'comprobado', 0, NULL, NULL, NULL),
+  ('#0063', 'Comida', 1350, 1350, 'comprobado', 0, NULL, NULL, NULL),
+  ('#0063', 'Vales', 200, 200, 'comprobado', 0, NULL, NULL, NULL),
+  ('#0064', 'Hotel', 1900, 1900, 'comprobado', 1, 'u6', '2026-10-20', NULL),
+  ('#0064', 'Avión', 1600, 1600, 'comprobado', 1, 'u6', '2026-10-20', NULL),
+  ('#0064', 'Uber', 450, 450, 'comprobado', 1, 'u6', '2026-10-20', NULL),
+  ('#0064', 'Comida', 1350, 1350, 'comprobado', 1, 'u6', '2026-10-20', NULL),
+  ('#0064', 'Vales', 250, 250, 'comprobado', 1, 'u6', '2026-10-20', NULL),
+  ('#0065', 'Hotel', 1780, 1780, 'comprobado', 1, 'u6', '2026-10-20', NULL),
+  ('#0065', 'Autobús', 1100, 1100, 'comprobado', 1, 'u6', '2026-10-20', NULL),
+  ('#0065', 'Uber', 380, 380, 'comprobado', 1, 'u6', '2026-10-20', NULL),
+  ('#0065', 'Comida', 1350, 1350, 'comprobado', 0, NULL, NULL, 'El RFC del receptor de esta factura no coincide con la sociedad; solicitar factura corregida.'),
+  ('#0065', 'Vales', 150, 150, 'comprobado', 0, NULL, NULL, NULL),
+  ('#0066', 'Hotel', 5100, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0066', 'Avión', 1800, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0066', 'Uber', 500, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0066', 'Comida', 1800, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0066', 'Vales', 0, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0067', 'Hotel', 3060, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0067', 'Autobús', 1100, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0067', 'Uber', 380, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0067', 'Comida', 1800, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0067', 'Vales', 0, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0068', 'Hotel', 2200, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0068', 'Autobús', 700, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0068', 'Uber', 250, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0068', 'Comida', 1350, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0068', 'Vales', 0, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0069', 'Hotel', 4800, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0069', 'Avión', 1900, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0069', 'Uber', 420, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0069', 'Comida', 1350, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0069', 'Vales', 0, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0070', 'Hotel', 4500, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0070', 'Autobús', 650, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0070', 'Uber', 300, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0070', 'Comida', 1800, 0, 'pendiente', 0, NULL, NULL, NULL),
+  ('#0070', 'Vales', 0, 0, 'pendiente', 0, NULL, NULL, NULL);
 
 -- facturas (metadatos)
-INSERT INTO facturas (id, solicitud_id, tipo, fecha, uuid, archivo, total, status, concepto_id, monto_aplicado, par_id) VALUES
-  ('fv_s19_1', 's19', 'XML', '2026-09-30', 'S191A7C1-4B2E-4F1A-9D3C-100000ABCDEF', 's19_hotel_factura.xml', 1580, 'Verificado', 'cgv_s19_1', 1580, 'par_fv_s19_1'),
-  ('fv_s19_1p', 's19', 'PDF', '2026-09-30', 'S191A7C1-4B2E-4F1A-9D3C-100000ABCDEF', 's19_hotel_factura.pdf', 1580, 'Verificado', 'cgv_s19_1', 0, 'par_fv_s19_1'),
-  ('fv_s19_2', 's19', 'XML', '2026-09-30', 'S192A7C1-4B2E-4F1A-9D3C-100037ABCDEF', 's19_autobús_factura.xml', 600, 'Verificado', 'cgv_s19_2', 600, 'par_fv_s19_2'),
-  ('fv_s19_2p', 's19', 'PDF', '2026-09-30', 'S192A7C1-4B2E-4F1A-9D3C-100037ABCDEF', 's19_autobús_factura.pdf', 600, 'Verificado', 'cgv_s19_2', 0, 'par_fv_s19_2'),
-  ('fv_s19_3', 's19', 'XML', '2026-09-30', 'S193A7C1-4B2E-4F1A-9D3C-100074ABCDEF', 's19_uber_factura.xml', 300, 'Verificado', 'cgv_s19_3', 300, 'par_fv_s19_3'),
-  ('fv_s19_3p', 's19', 'PDF', '2026-09-30', 'S193A7C1-4B2E-4F1A-9D3C-100074ABCDEF', 's19_uber_factura.pdf', 300, 'Verificado', 'cgv_s19_3', 0, 'par_fv_s19_3'),
-  ('fv_s19_4', 's19', 'XML', '2026-09-30', 'S194A7C1-4B2E-4F1A-9D3C-100111ABCDEF', 's19_comida_factura.xml', 1350, 'Verificado', 'cgv_s19_4', 1350, 'par_fv_s19_4'),
-  ('fv_s19_4p', 's19', 'PDF', '2026-09-30', 'S194A7C1-4B2E-4F1A-9D3C-100111ABCDEF', 's19_comida_factura.pdf', 1350, 'Verificado', 'cgv_s19_4', 0, 'par_fv_s19_4'),
-  ('fv_s19_5', 's19', 'PDF', '2026-09-30', 'S195A7C1-4B2E-4F1A-9D3C-100148ABCDEF', 's19_vales_comprobante.pdf', 200, 'Verificado', 'cgv_s19_5', 200, NULL),
-  ('fv_s20_1', 's20', 'XML', '2026-10-07', 'S201A7C1-4B2E-4F1A-9D3C-100000ABCDEF', 's20_hotel_factura.xml', 1900, 'Verificado', 'cgv_s20_1', 1900, 'par_fv_s20_1'),
-  ('fv_s20_1p', 's20', 'PDF', '2026-10-07', 'S201A7C1-4B2E-4F1A-9D3C-100000ABCDEF', 's20_hotel_factura.pdf', 1900, 'Verificado', 'cgv_s20_1', 0, 'par_fv_s20_1'),
-  ('fv_s20_2', 's20', 'XML', '2026-10-07', 'S202A7C1-4B2E-4F1A-9D3C-100037ABCDEF', 's20_avión_factura.xml', 1600, 'Verificado', 'cgv_s20_2', 1600, 'par_fv_s20_2'),
-  ('fv_s20_2p', 's20', 'PDF', '2026-10-07', 'S202A7C1-4B2E-4F1A-9D3C-100037ABCDEF', 's20_avión_factura.pdf', 1600, 'Verificado', 'cgv_s20_2', 0, 'par_fv_s20_2'),
-  ('fv_s20_3', 's20', 'XML', '2026-10-07', 'S203A7C1-4B2E-4F1A-9D3C-100074ABCDEF', 's20_uber_factura.xml', 450, 'Verificado', 'cgv_s20_3', 450, 'par_fv_s20_3'),
-  ('fv_s20_3p', 's20', 'PDF', '2026-10-07', 'S203A7C1-4B2E-4F1A-9D3C-100074ABCDEF', 's20_uber_factura.pdf', 450, 'Verificado', 'cgv_s20_3', 0, 'par_fv_s20_3'),
-  ('fv_s20_4', 's20', 'XML', '2026-10-07', 'S204A7C1-4B2E-4F1A-9D3C-100111ABCDEF', 's20_comida_factura.xml', 1350, 'Verificado', 'cgv_s20_4', 1350, 'par_fv_s20_4'),
-  ('fv_s20_4p', 's20', 'PDF', '2026-10-07', 'S204A7C1-4B2E-4F1A-9D3C-100111ABCDEF', 's20_comida_factura.pdf', 1350, 'Verificado', 'cgv_s20_4', 0, 'par_fv_s20_4'),
-  ('fv_s20_5', 's20', 'PDF', '2026-10-07', 'S205A7C1-4B2E-4F1A-9D3C-100148ABCDEF', 's20_vales_comprobante.pdf', 250, 'Verificado', 'cgv_s20_5', 250, NULL),
-  ('fv_s21_1', 's21', 'XML', '2026-10-14', 'S211A7C1-4B2E-4F1A-9D3C-100000ABCDEF', 's21_hotel_factura.xml', 1780, 'Verificado', 'cgv_s21_1', 1780, 'par_fv_s21_1'),
-  ('fv_s21_1p', 's21', 'PDF', '2026-10-14', 'S211A7C1-4B2E-4F1A-9D3C-100000ABCDEF', 's21_hotel_factura.pdf', 1780, 'Verificado', 'cgv_s21_1', 0, 'par_fv_s21_1'),
-  ('fv_s21_2', 's21', 'XML', '2026-10-14', 'S212A7C1-4B2E-4F1A-9D3C-100037ABCDEF', 's21_autobús_factura.xml', 1100, 'Verificado', 'cgv_s21_2', 1100, 'par_fv_s21_2'),
-  ('fv_s21_2p', 's21', 'PDF', '2026-10-14', 'S212A7C1-4B2E-4F1A-9D3C-100037ABCDEF', 's21_autobús_factura.pdf', 1100, 'Verificado', 'cgv_s21_2', 0, 'par_fv_s21_2'),
-  ('fv_s21_3', 's21', 'XML', '2026-10-14', 'S213A7C1-4B2E-4F1A-9D3C-100074ABCDEF', 's21_uber_factura.xml', 380, 'Verificado', 'cgv_s21_3', 380, 'par_fv_s21_3'),
-  ('fv_s21_3p', 's21', 'PDF', '2026-10-14', 'S213A7C1-4B2E-4F1A-9D3C-100074ABCDEF', 's21_uber_factura.pdf', 380, 'Verificado', 'cgv_s21_3', 0, 'par_fv_s21_3'),
-  ('fv_s21_4', 's21', 'XML', '2026-10-14', 'S214A7C1-4B2E-4F1A-9D3C-100111ABCDEF', 's21_comida_factura.xml', 1350, 'Verificado', 'cgv_s21_4', 1350, 'par_fv_s21_4'),
-  ('fv_s21_4p', 's21', 'PDF', '2026-10-14', 'S214A7C1-4B2E-4F1A-9D3C-100111ABCDEF', 's21_comida_factura.pdf', 1350, 'Verificado', 'cgv_s21_4', 0, 'par_fv_s21_4'),
-  ('fv_s21_5', 's21', 'PDF', '2026-10-14', 'S215A7C1-4B2E-4F1A-9D3C-100148ABCDEF', 's21_vales_comprobante.pdf', 150, 'Verificado', 'cgv_s21_5', 150, NULL);
+INSERT INTO facturas (id, solicitud_id, tipo, fecha, uuid, archivo, total, status, concepto, monto_aplicado, par_id) VALUES
+  ('fv_s19_1', '#0063', 'XML', '2026-09-30', 'S191A7C1-4B2E-4F1A-9D3C-100000ABCDEF', 's19_hotel_factura.xml', 1580, 'Verificado', 'Hotel', 1580, 'par_fv_s19_1'),
+  ('fv_s19_1p', '#0063', 'PDF', '2026-09-30', 'S191A7C1-4B2E-4F1A-9D3C-100000ABCDEF', 's19_hotel_factura.pdf', 1580, 'Verificado', 'Hotel', 0, 'par_fv_s19_1'),
+  ('fv_s19_2', '#0063', 'XML', '2026-09-30', 'S192A7C1-4B2E-4F1A-9D3C-100037ABCDEF', 's19_autobús_factura.xml', 600, 'Verificado', 'Autobús', 600, 'par_fv_s19_2'),
+  ('fv_s19_2p', '#0063', 'PDF', '2026-09-30', 'S192A7C1-4B2E-4F1A-9D3C-100037ABCDEF', 's19_autobús_factura.pdf', 600, 'Verificado', 'Autobús', 0, 'par_fv_s19_2'),
+  ('fv_s19_3', '#0063', 'XML', '2026-09-30', 'S193A7C1-4B2E-4F1A-9D3C-100074ABCDEF', 's19_uber_factura.xml', 300, 'Verificado', 'Uber', 300, 'par_fv_s19_3'),
+  ('fv_s19_3p', '#0063', 'PDF', '2026-09-30', 'S193A7C1-4B2E-4F1A-9D3C-100074ABCDEF', 's19_uber_factura.pdf', 300, 'Verificado', 'Uber', 0, 'par_fv_s19_3'),
+  ('fv_s19_4', '#0063', 'XML', '2026-09-30', 'S194A7C1-4B2E-4F1A-9D3C-100111ABCDEF', 's19_comida_factura.xml', 1350, 'Verificado', 'Comida', 1350, 'par_fv_s19_4'),
+  ('fv_s19_4p', '#0063', 'PDF', '2026-09-30', 'S194A7C1-4B2E-4F1A-9D3C-100111ABCDEF', 's19_comida_factura.pdf', 1350, 'Verificado', 'Comida', 0, 'par_fv_s19_4'),
+  ('fv_s19_5', '#0063', 'PDF', '2026-09-30', 'S195A7C1-4B2E-4F1A-9D3C-100148ABCDEF', 's19_vales_comprobante.pdf', 200, 'Verificado', 'Vales', 200, NULL),
+  ('fv_s20_1', '#0064', 'XML', '2026-10-07', 'S201A7C1-4B2E-4F1A-9D3C-100000ABCDEF', 's20_hotel_factura.xml', 1900, 'Verificado', 'Hotel', 1900, 'par_fv_s20_1'),
+  ('fv_s20_1p', '#0064', 'PDF', '2026-10-07', 'S201A7C1-4B2E-4F1A-9D3C-100000ABCDEF', 's20_hotel_factura.pdf', 1900, 'Verificado', 'Hotel', 0, 'par_fv_s20_1'),
+  ('fv_s20_2', '#0064', 'XML', '2026-10-07', 'S202A7C1-4B2E-4F1A-9D3C-100037ABCDEF', 's20_avión_factura.xml', 1600, 'Verificado', 'Avión', 1600, 'par_fv_s20_2'),
+  ('fv_s20_2p', '#0064', 'PDF', '2026-10-07', 'S202A7C1-4B2E-4F1A-9D3C-100037ABCDEF', 's20_avión_factura.pdf', 1600, 'Verificado', 'Avión', 0, 'par_fv_s20_2'),
+  ('fv_s20_3', '#0064', 'XML', '2026-10-07', 'S203A7C1-4B2E-4F1A-9D3C-100074ABCDEF', 's20_uber_factura.xml', 450, 'Verificado', 'Uber', 450, 'par_fv_s20_3'),
+  ('fv_s20_3p', '#0064', 'PDF', '2026-10-07', 'S203A7C1-4B2E-4F1A-9D3C-100074ABCDEF', 's20_uber_factura.pdf', 450, 'Verificado', 'Uber', 0, 'par_fv_s20_3'),
+  ('fv_s20_4', '#0064', 'XML', '2026-10-07', 'S204A7C1-4B2E-4F1A-9D3C-100111ABCDEF', 's20_comida_factura.xml', 1350, 'Verificado', 'Comida', 1350, 'par_fv_s20_4'),
+  ('fv_s20_4p', '#0064', 'PDF', '2026-10-07', 'S204A7C1-4B2E-4F1A-9D3C-100111ABCDEF', 's20_comida_factura.pdf', 1350, 'Verificado', 'Comida', 0, 'par_fv_s20_4'),
+  ('fv_s20_5', '#0064', 'PDF', '2026-10-07', 'S205A7C1-4B2E-4F1A-9D3C-100148ABCDEF', 's20_vales_comprobante.pdf', 250, 'Verificado', 'Vales', 250, NULL),
+  ('fv_s21_1', '#0065', 'XML', '2026-10-14', 'S211A7C1-4B2E-4F1A-9D3C-100000ABCDEF', 's21_hotel_factura.xml', 1780, 'Verificado', 'Hotel', 1780, 'par_fv_s21_1'),
+  ('fv_s21_1p', '#0065', 'PDF', '2026-10-14', 'S211A7C1-4B2E-4F1A-9D3C-100000ABCDEF', 's21_hotel_factura.pdf', 1780, 'Verificado', 'Hotel', 0, 'par_fv_s21_1'),
+  ('fv_s21_2', '#0065', 'XML', '2026-10-14', 'S212A7C1-4B2E-4F1A-9D3C-100037ABCDEF', 's21_autobús_factura.xml', 1100, 'Verificado', 'Autobús', 1100, 'par_fv_s21_2'),
+  ('fv_s21_2p', '#0065', 'PDF', '2026-10-14', 'S212A7C1-4B2E-4F1A-9D3C-100037ABCDEF', 's21_autobús_factura.pdf', 1100, 'Verificado', 'Autobús', 0, 'par_fv_s21_2'),
+  ('fv_s21_3', '#0065', 'XML', '2026-10-14', 'S213A7C1-4B2E-4F1A-9D3C-100074ABCDEF', 's21_uber_factura.xml', 380, 'Verificado', 'Uber', 380, 'par_fv_s21_3'),
+  ('fv_s21_3p', '#0065', 'PDF', '2026-10-14', 'S213A7C1-4B2E-4F1A-9D3C-100074ABCDEF', 's21_uber_factura.pdf', 380, 'Verificado', 'Uber', 0, 'par_fv_s21_3'),
+  ('fv_s21_4', '#0065', 'XML', '2026-10-14', 'S214A7C1-4B2E-4F1A-9D3C-100111ABCDEF', 's21_comida_factura.xml', 1350, 'Verificado', 'Comida', 1350, 'par_fv_s21_4'),
+  ('fv_s21_4p', '#0065', 'PDF', '2026-10-14', 'S214A7C1-4B2E-4F1A-9D3C-100111ABCDEF', 's21_comida_factura.pdf', 1350, 'Verificado', 'Comida', 0, 'par_fv_s21_4'),
+  ('fv_s21_5', '#0065', 'PDF', '2026-10-14', 'S215A7C1-4B2E-4F1A-9D3C-100148ABCDEF', 's21_vales_comprobante.pdf', 150, 'Verificado', 'Vales', 150, NULL);
 
 -- contenido de las facturas (LONGBLOB)
 INSERT INTO factura_archivos (factura_id, mime, contenido) VALUES
@@ -1046,11 +1092,11 @@ INSERT INTO convenios (id, anio, tipo_sucursal, no_sucursal, destino, estado, no
 
 -- revisiones de montos manuales de hotel
 INSERT INTO revisiones_monto (id, solicitud_id, folio, user_id, destino_estado, hotel_stay_id, hotel_id, hotel_nombre, tipo_habitacion, tarifa_default, monto_manual, motivo, noches, fecha_inicio, fecha_fin, creada_at, estado, vigente, decidido_por, decidido_at, comentario) VALUES
-  ('rev_e3cb8kl2', 's25', '#0070', 'u7', 'Guanajuato', 'hh_s25_1', 13, 'Holiday Inn León', 'sencilla', 880, 1500, NULL, 3, '2026-11-23', '2026-11-26', '2026-11-04 21:09:15.196', 'rechazado', 1, 'u6', '2026-11-03 21:09:15.196', 'Excede la tarifa convenida; reservar en Fiesta Inn León ($790) o Hotel One León Norte ($620).'),
-  ('rev_o7d2owr8', 's24', '#0069', 'u3', 'CDMX', 'hh_s24_1', 7, 'Presidente Intercontinental', 'sencilla', 1850, 2400, NULL, 2, '2026-11-02', '2026-11-04', '2026-11-04 21:09:15.196', 'aceptado', 1, 'u6', '2026-11-04 21:09:15.196', 'Evento de la cámara en la ciudad; no hay tarifa corporativa disponible esas fechas.'),
-  ('rev_7thbrbzm', 's26', '#0068', 'u2', 'Querétaro', 'hh_s26_1', 19, 'Radisson Querétaro', 'sencilla', 870, 1100, NULL, 2, '2026-11-04', '2026-11-06', '2026-11-04 21:09:15.195', 'pendiente', 1, NULL, NULL, NULL),
-  ('rev_3nm72l9i', 's23', '#0067', 'u8', 'Zacatecas', 'hh_s23_1', 26, 'Emporio Zacatecas', 'sencilla', 890, 1250, NULL, 2, '2026-11-16', '2026-11-18', '2026-11-04 21:09:15.195', 'pendiente', 1, NULL, NULL, NULL),
-  ('rev_1smfebct', 's22', '#0066', 'u7', 'Nuevo León', 'hh_s22_1', 17, 'Camino Real Monterrey', 'sencilla', 1380, 1700, NULL, 3, '2026-11-09', '2026-11-12', '2026-11-04 21:09:15.176', 'pendiente', 1, NULL, NULL, NULL);
+  ('rev_e3cb8kl2', '#0070', '#0070', 'u7', 'Guanajuato', 'hh_s25_1', 13, 'Holiday Inn León', 'sencilla', 880, 1500, NULL, 3, '2026-11-23', '2026-11-26', '2026-11-04 21:09:15.196', 'rechazado', 1, 'u6', '2026-11-03 21:09:15.196', 'Excede la tarifa convenida; reservar en Fiesta Inn León ($790) o Hotel One León Norte ($620).'),
+  ('rev_o7d2owr8', '#0069', '#0069', 'u3', 'CDMX', 'hh_s24_1', 7, 'Presidente Intercontinental', 'sencilla', 1850, 2400, NULL, 2, '2026-11-02', '2026-11-04', '2026-11-04 21:09:15.196', 'aceptado', 1, 'u6', '2026-11-04 21:09:15.196', 'Evento de la cámara en la ciudad; no hay tarifa corporativa disponible esas fechas.'),
+  ('rev_7thbrbzm', '#0068', '#0068', 'u2', 'Querétaro', 'hh_s26_1', 19, 'Radisson Querétaro', 'sencilla', 870, 1100, NULL, 2, '2026-11-04', '2026-11-06', '2026-11-04 21:09:15.195', 'pendiente', 1, NULL, NULL, NULL),
+  ('rev_3nm72l9i', '#0067', '#0067', 'u8', 'Zacatecas', 'hh_s23_1', 26, 'Emporio Zacatecas', 'sencilla', 890, 1250, NULL, 2, '2026-11-16', '2026-11-18', '2026-11-04 21:09:15.195', 'pendiente', 1, NULL, NULL, NULL),
+  ('rev_1smfebct', '#0066', '#0066', 'u7', 'Nuevo León', 'hh_s22_1', 17, 'Camino Real Monterrey', 'sencilla', 1380, 1700, NULL, 3, '2026-11-09', '2026-11-12', '2026-11-04 21:09:15.176', 'pendiente', 1, NULL, NULL, NULL);
 
 -- correos simulados
 INSERT INTO correos (id, fecha, para, usuario_id, asunto, cuerpo, referencia, estado) VALUES
@@ -1126,7 +1172,7 @@ INSERT INTO logs (id, fecha, tipo, entidad, entidad_id, usuario_id, detalle) VAL
 -- Renglones de gasto por concepto (Dashboard / Reportes). Las solicitudes rechazadas no cuentan;
 -- la gasolina no se comprueba, así que cuenta igual como solicitada y comprobada.
 CREATE VIEW v_renglones_gasto AS
-  SELECT s.id AS solicitud_id, s.folio, s.user_id, s.empresa, DATE(s.created_at) AS created_at,
+  SELECT s.folio AS solicitud_id, s.folio, s.user_id, s.empresa, DATE(s.created_at) AS created_at,
          CASE
            WHEN c.concepto = 'Hotel' THEN 'Hotel'
            WHEN c.concepto IN ('Avión','Autobús','Tren','Otro (foráneo)','Transporte foráneo') THEN 'Transporte foráneo'
@@ -1139,7 +1185,7 @@ CREATE VIEW v_renglones_gasto AS
          c.monto_solicitado AS solicitado,
          c.monto_comprobado AS comprobado
     FROM solicitudes s
-    JOIN comprobantes_gasto c ON c.solicitud_id = s.id
+    JOIN comprobantes_gasto c ON c.solicitud_id = s.folio
    WHERE s.estatus <> 'Rechazado'
      AND c.monto_solicitado > 0
      AND c.concepto IN ('Hotel','Avión','Autobús','Tren','Otro (foráneo)','Transporte foráneo',
@@ -1149,10 +1195,43 @@ CREATE VIEW v_renglones_gasto AS
   SELECT s.id, s.folio, s.user_id, s.empresa, DATE(s.created_at),
          'Automóvil', 'Gasolina', SUM(d.gasolina), SUM(d.gasolina)
     FROM solicitudes s
-    JOIN solicitud_destinos d ON d.solicitud_id = s.id
+    JOIN solicitud_destinos d ON d.solicitud_id = s.folio
    WHERE s.estatus <> 'Rechazado'
    GROUP BY s.id, s.folio, s.user_id, s.empresa, DATE(s.created_at)
   HAVING SUM(d.gasolina) > 0;
+
+-- Estado de cada bolsa de presupuesto. Un folio cuenta en la bolsa de su departamento cuyo rango cubre la
+-- fecha de la solicitud. ejercido = monto total de los folios autorizados (Cerrado); por_autorizar = folios aún
+-- Abiertos (informativo, no descuenta); comprobado = lo comprobado con facturas de los folios autorizados.
+CREATE VIEW v_presupuestos AS
+  SELECT p.id, p.departamento_id, d.nombre AS departamento, d.activo AS departamento_activo,
+         p.fecha_inicio, p.fecha_fin, p.monto, p.notas, p.creado_por, p.creado_at, p.actualizado_at,
+         COALESCE(a.ejercido, 0)                AS ejercido,
+         COALESCE(a.folios, 0)                  AS folios_autorizados,
+         COALESCE(a.comprobado, 0)              AS comprobado,
+         COALESCE(pa.por_autorizar, 0)          AS por_autorizar,
+         COALESCE(pa.folios, 0)                 AS folios_por_autorizar,
+         p.monto - COALESCE(a.ejercido, 0)      AS disponible
+    FROM presupuestos p
+    JOIN departamentos d ON d.id = p.departamento_id
+    LEFT JOIN (
+      SELECT p2.id AS presupuesto_id, SUM(s.monto_total) AS ejercido, COUNT(*) AS folios,
+             SUM((SELECT COALESCE(SUM(c.monto_comprobado), 0) FROM comprobantes_gasto c
+                   WHERE c.solicitud_id = s.folio)) AS comprobado
+        FROM presupuestos p2
+        JOIN solicitudes s ON s.departamento_id = p2.departamento_id
+                          AND s.fecha BETWEEN p2.fecha_inicio AND p2.fecha_fin
+       WHERE s.estatus = 'Cerrado'
+       GROUP BY p2.id
+    ) a ON a.presupuesto_id = p.id
+    LEFT JOIN (
+      SELECT p3.id AS presupuesto_id, SUM(s.monto_total) AS por_autorizar, COUNT(*) AS folios
+        FROM presupuestos p3
+        JOIN solicitudes s ON s.departamento_id = p3.departamento_id
+                          AND s.fecha BETWEEN p3.fecha_inicio AND p3.fecha_fin
+       WHERE s.estatus = 'Abierto'
+       GROUP BY p3.id
+    ) pa ON pa.presupuesto_id = p.id;
 
 -- ───────────────────────────── 5. Procedimientos almacenados ─────────────────────────────
 DELIMITER $$
@@ -1196,6 +1275,13 @@ BEGIN
   DECLARE v_umbral DECIMAL(12,2) DEFAULT 5000;
   DECLARE v_bloquear TINYINT(1) DEFAULT 0;
   DECLARE v_paso VARCHAR(20) DEFAULT NULL;
+  DECLARE v_depto INT DEFAULT NULL;
+  DECLARE v_depto_nombre VARCHAR(80) DEFAULT NULL;
+  DECLARE v_fecha DATE;
+  DECLARE v_presupuesto VARCHAR(40) DEFAULT NULL;
+  DECLARE v_disponible DECIMAL(14,2) DEFAULT NULL;
+  DECLARE v_bloquear_pres TINYINT(1) DEFAULT 0;
+  DECLARE v_msg VARCHAR(255);
 
   DECLARE EXIT HANDLER FOR SQLEXCEPTION
   BEGIN
@@ -1214,8 +1300,8 @@ BEGIN
     SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'La solicitud no existe.';
   END IF;
 
-  SELECT user_id, estatus, jefe_status, finanzas_status, monto_total, folio
-    INTO v_owner, v_estatus, v_jefe, v_fin, v_monto, v_folio
+  SELECT user_id, estatus, jefe_status, finanzas_status, monto_total, folio, departamento_id, fecha
+    INTO v_owner, v_estatus, v_jefe, v_fin, v_monto, v_folio, v_depto, v_fecha
     FROM solicitudes WHERE id = p_solicitud_id FOR UPDATE;
 
   SELECT COALESCE(JSON_UNQUOTE(JSON_EXTRACT(r.permisos, '$.autorizar_lte5000')) = 'true', 0),
@@ -1252,16 +1338,48 @@ BEGIN
     SELECT COALESCE(JSON_UNQUOTE(valor) = 'true', 0) INTO v_bloquear
       FROM configuracion WHERE clave = 'bloquear_folio_monto_hotel';
     IF v_bloquear = 1 AND EXISTS (SELECT 1 FROM revisiones_monto
-                                   WHERE solicitud_id = p_solicitud_id AND vigente = 1
+                                   WHERE solicitud_id = v_folio AND vigente = 1
                                      AND estado IN ('pendiente', 'rechazado')) THEN
       SIGNAL SQLSTATE '45000'
         SET MESSAGE_TEXT = 'Bloqueado: el monto manual de hotel está pendiente o rechazado por Compras.';
     END IF;
   END IF;
 
-  INSERT INTO autorizaciones (id, solicitud_id, rol_autorizador, user_id, status, fecha, nota)
-  VALUES (CONCAT('a_', SUBSTRING(REPLACE(UUID(), '-', ''), 1, 10)), p_solicitud_id,
-          IF(v_paso = 'jefe', 'jefe_inmediato', 'finanzas'), p_user_id, p_decision, CURDATE(),
+  -- La llave de autorizaciones es (folio, usuario): una persona registra una sola decisión por solicitud.
+  IF EXISTS (SELECT 1 FROM autorizaciones WHERE solicitud_id = v_folio AND user_id = p_user_id) THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Ya registraste una decisión en esta solicitud; el siguiente paso lo debe dar otra persona.';
+  END IF;
+
+  -- Presupuesto del departamento: el folio aún está Abierto, así que no está contado en lo ejercido.
+  -- Si no hay bolsa que cubra la fecha o el disponible no alcanza, se registra en la bitácora y, con el
+  -- parámetro bloquear_autorizacion_sin_presupuesto activo, no se autoriza. Folios sin departamento no aplican.
+  IF p_decision = 'autorizado' AND v_depto IS NOT NULL THEN
+    SELECT nombre INTO v_depto_nombre FROM departamentos WHERE id = v_depto;
+    SELECT id, disponible INTO v_presupuesto, v_disponible
+      FROM v_presupuestos
+     WHERE departamento_id = v_depto AND v_fecha BETWEEN fecha_inicio AND fecha_fin
+     LIMIT 1;
+    IF v_presupuesto IS NULL OR v_disponible < v_monto THEN
+      SELECT COALESCE(JSON_UNQUOTE(valor) = 'true', 0) INTO v_bloquear_pres
+        FROM configuracion WHERE clave = 'bloquear_autorizacion_sin_presupuesto';
+      IF v_bloquear_pres = 1 THEN
+        SET v_msg = IF(v_presupuesto IS NULL,
+          CONCAT('Bloqueado: el departamento ', v_depto_nombre, ' no tiene presupuesto para el ',
+                 DATE_FORMAT(v_fecha, '%d/%m/%Y'), '.'),
+          CONCAT('Bloqueado: el folio ', v_folio, ' ($', FORMAT(v_monto, 0), ') excede el presupuesto disponible de ',
+                 v_depto_nombre, ' ($', FORMAT(v_disponible, 0), ').'));
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = v_msg;
+      END IF;
+      CALL sp_registrar_log('autorizacion_sobre_presupuesto', 'solicitud', p_solicitud_id, p_user_id,
+        JSON_OBJECT('folio', v_folio, 'departamento', v_depto_nombre, 'paso', v_paso, 'monto', v_monto,
+                    'presupuesto_id', v_presupuesto, 'disponible', v_disponible));
+    END IF;
+  END IF;
+
+  INSERT INTO autorizaciones (solicitud_id, rol_autorizador, user_id, user_nombre, status, fecha, nota)
+  VALUES (v_folio, IF(v_paso = 'jefe', 'jefe_inmediato', 'finanzas'), p_user_id,
+          (SELECT nombre FROM usuarios WHERE id = p_user_id), p_decision, CURDATE(),
           COALESCE(IF(p_decision = 'rechazado', p_nota, ''), ''));
 
   IF p_decision = 'rechazado' THEN
@@ -1308,7 +1426,7 @@ BEGIN
   END IF;
 
   START TRANSACTION;
-  DELETE FROM autorizaciones WHERE solicitud_id = p_solicitud_id;
+  DELETE FROM autorizaciones WHERE solicitud_id = v_folio;
   UPDATE solicitudes
      SET estatus = 'Abierto', jefe_status = 'Pendiente',
          finanzas_status = IF(finanzas_status = 'N/A', 'N/A', 'Pendiente'), nota_rechazo = NULL
@@ -1322,11 +1440,14 @@ END$$
 -- los depósitos sobrantes del folio suman al comprobado (no aplican con p_solo_avion).
 CREATE PROCEDURE sp_recalcular_comprobacion(IN p_solicitud_id VARCHAR(40), IN p_solo_avion TINYINT(1))
 BEGIN
+  DECLARE v_folio VARCHAR(10);
   DECLARE v_dep DECIMAL(12,2) DEFAULT 0;
+  SELECT folio INTO v_folio FROM solicitudes WHERE id = p_solicitud_id;
   IF p_solo_avion = 0 THEN
-    SELECT COALESCE(SUM(monto), 0) INTO v_dep FROM depositos_sobrante WHERE solicitud_id = p_solicitud_id;
+    SELECT COALESCE(SUM(monto), 0) INTO v_dep FROM depositos_sobrante WHERE solicitud_id = v_folio;
   END IF;
-  SELECT p_solicitud_id AS solicitud_id,
+
+  SELECT v_folio AS solicitud_id,
          COALESCE(SUM(monto_solicitado), 0) AS solicitado,
          COALESCE(SUM(monto_comprobado), 0) + v_dep AS comprobado,
          (COALESCE(SUM(monto_solicitado), 0) > 0
@@ -1335,7 +1456,7 @@ BEGIN
               THEN LEAST(100, ROUND((SUM(monto_comprobado) + v_dep) / SUM(monto_solicitado) * 100))
               ELSE 0 END AS pct
     FROM comprobantes_gasto
-   WHERE solicitud_id = p_solicitud_id
+   WHERE solicitud_id = v_folio
      AND (p_solo_avion = 0 OR concepto = 'Avión');
 END$$
 
@@ -1349,9 +1470,9 @@ BEGIN
       SELECT s.id, s.folio, s.monto_total,
              COALESCE(SUM(c.monto_solicitado), 0) AS solicitado,
              COALESCE(SUM(c.monto_comprobado), 0)
-               + COALESCE((SELECT SUM(d.monto) FROM depositos_sobrante d WHERE d.solicitud_id = s.id), 0) AS comprobado
+               + COALESCE((SELECT SUM(d.monto) FROM depositos_sobrante d WHERE d.solicitud_id = s.folio), 0) AS comprobado
         FROM solicitudes s
-        LEFT JOIN comprobantes_gasto c ON c.solicitud_id = s.id
+        LEFT JOIN comprobantes_gasto c ON c.solicitud_id = s.folio
        WHERE s.user_id = p_user_id AND s.estatus = 'Cerrado'
        GROUP BY s.id, s.folio, s.monto_total
     ) t
@@ -1461,6 +1582,38 @@ BEGIN
    ORDER BY monto DESC, categoria, subconcepto;
 END$$
 
+-- Reglas de una bolsa de presupuesto (las llaman trg_presupuestos_bi/bu): fechas en orden, monto no negativo,
+-- departamento existente y sin empalme con otra bolsa del mismo departamento.
+CREATE PROCEDURE sp_validar_presupuesto(
+  IN p_id VARCHAR(40), IN p_depto INT, IN p_inicio DATE, IN p_fin DATE, IN p_monto DECIMAL(12,2))
+BEGIN
+  DECLARE v_ini DATE DEFAULT NULL;
+  DECLARE v_fin DATE DEFAULT NULL;
+  DECLARE v_msg VARCHAR(255);
+  IF p_inicio IS NULL OR p_fin IS NULL THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Captura la fecha inicial y la final del presupuesto.';
+  END IF;
+  IF p_fin < p_inicio THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'La fecha final del presupuesto no puede ser anterior a la inicial.';
+  END IF;
+  IF p_monto IS NULL OR p_monto < 0 THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'El monto del presupuesto no puede ser negativo.';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM departamentos WHERE id = p_depto) THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'El departamento no existe.';
+  END IF;
+  SELECT fecha_inicio, fecha_fin INTO v_ini, v_fin
+    FROM presupuestos
+   WHERE departamento_id = p_depto AND id <> p_id AND fecha_inicio <= p_fin AND fecha_fin >= p_inicio
+   ORDER BY fecha_inicio
+   LIMIT 1;
+  IF v_ini IS NOT NULL THEN
+    SET v_msg = CONCAT('Las fechas se empalman con otro presupuesto del mismo departamento (',
+                       DATE_FORMAT(v_ini, '%d/%m/%Y'), ' al ', DATE_FORMAT(v_fin, '%d/%m/%Y'), ').');
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = v_msg;
+  END IF;
+END$$
+
 -- ───────────────────────────── 6. Triggers ─────────────────────────────
 
 -- Usuarios: nadie es su propio jefe.
@@ -1478,6 +1631,39 @@ BEGIN
   END IF;
 END$$
 
+-- Usuarios: autorizaciones.user_nombre siempre es el nombre vigente del usuario (se propaga al renombrar).
+-- Al asignarle departamento a quien no tenía, sus folios sin departamento pasan a ese departamento
+-- (para que cuenten en su presupuesto). Un cambio de departamento NO mueve los folios ya registrados.
+CREATE TRIGGER trg_usuarios_au AFTER UPDATE ON usuarios FOR EACH ROW
+BEGIN
+  IF NOT (NEW.nombre <=> OLD.nombre) THEN
+    UPDATE autorizaciones SET user_nombre = NEW.nombre WHERE user_id = NEW.id;
+  END IF;
+  IF OLD.departamento_id IS NULL AND NEW.departamento_id IS NOT NULL THEN
+    UPDATE solicitudes SET departamento_id = NEW.departamento_id
+     WHERE user_id = NEW.id AND departamento_id IS NULL;
+  END IF;
+  IF NOT (OLD.departamento_id <=> NEW.departamento_id) THEN
+    CALL sp_registrar_log('usuario_departamento', 'usuario', NEW.id, @ckl_usuario_id,
+      JSON_OBJECT('usuario', NEW.nombre,
+                  'antes', (SELECT nombre FROM departamentos WHERE id = OLD.departamento_id),
+                  'despues', (SELECT nombre FROM departamentos WHERE id = NEW.departamento_id)));
+  END IF;
+END$$
+
+CREATE TRIGGER trg_autorizaciones_bi BEFORE INSERT ON autorizaciones FOR EACH ROW
+BEGIN
+  SET NEW.user_nombre = (SELECT nombre FROM usuarios WHERE id = NEW.user_id);
+END$$
+
+-- Solicitudes: el folio toma el departamento de su solicitante al crearse (y ya no cambia).
+CREATE TRIGGER trg_solicitudes_bi BEFORE INSERT ON solicitudes FOR EACH ROW
+BEGIN
+  IF NEW.departamento_id IS NULL THEN
+    SET NEW.departamento_id = (SELECT departamento_id FROM usuarios WHERE id = NEW.user_id);
+  END IF;
+END$$
+
 -- Solicitudes: bitácora y reglas de edición/borrado.
 CREATE TRIGGER trg_solicitudes_ai AFTER INSERT ON solicitudes FOR EACH ROW
 BEGIN
@@ -1489,7 +1675,7 @@ CREATE TRIGGER trg_solicitudes_bu BEFORE UPDATE ON solicitudes FOR EACH ROW
 BEGIN
   -- Con autorizaciones registradas ya no se puede cambiar el monto (edición solo si no hay ninguna).
   IF NEW.monto_total <> OLD.monto_total
-     AND EXISTS (SELECT 1 FROM autorizaciones WHERE solicitud_id = OLD.id) THEN
+     AND EXISTS (SELECT 1 FROM autorizaciones WHERE solicitud_id = OLD.folio) THEN
     SIGNAL SQLSTATE '45000'
       SET MESSAGE_TEXT = 'No se puede modificar el monto: la solicitud ya tiene autorizaciones.';
   END IF;
@@ -1508,7 +1694,7 @@ END$$
 
 CREATE TRIGGER trg_solicitudes_bd BEFORE DELETE ON solicitudes FOR EACH ROW
 BEGIN
-  IF EXISTS (SELECT 1 FROM autorizaciones WHERE solicitud_id = OLD.id) THEN
+  IF EXISTS (SELECT 1 FROM autorizaciones WHERE solicitud_id = OLD.folio) THEN
     SIGNAL SQLSTATE '45000'
       SET MESSAGE_TEXT = 'No se puede eliminar: la solicitud ya tiene autorizaciones.';
   END IF;
@@ -1548,19 +1734,19 @@ END$$
 -- Facturas: aplicar / revertir exactamente monto_aplicado en el renglón de comprobación.
 CREATE TRIGGER trg_facturas_ai AFTER INSERT ON facturas FOR EACH ROW
 BEGIN
-  IF NEW.concepto_id IS NOT NULL AND NEW.monto_aplicado <> 0 THEN
+  IF NEW.concepto IS NOT NULL AND NEW.monto_aplicado <> 0 THEN
     UPDATE comprobantes_gasto
        SET monto_comprobado = monto_comprobado + NEW.monto_aplicado
-     WHERE id = NEW.concepto_id;
+     WHERE solicitud_id = NEW.solicitud_id AND concepto = NEW.concepto;
   END IF;
 END$$
 
 CREATE TRIGGER trg_facturas_ad AFTER DELETE ON facturas FOR EACH ROW
 BEGIN
-  IF OLD.concepto_id IS NOT NULL AND OLD.monto_aplicado <> 0 THEN
+  IF OLD.concepto IS NOT NULL AND OLD.monto_aplicado <> 0 THEN
     UPDATE comprobantes_gasto
        SET monto_comprobado = GREATEST(0, monto_comprobado - OLD.monto_aplicado)
-     WHERE id = OLD.concepto_id;
+     WHERE solicitud_id = OLD.solicitud_id AND concepto = OLD.concepto;
   END IF;
 END$$
 
@@ -1687,6 +1873,46 @@ BEGIN
       JSON_OBJECT('folio', NEW.folio, 'hotel', NEW.hotel_nombre, 'monto_manual', NEW.monto_manual,
                   'comentario', NEW.comentario));
   END IF;
+END$$
+
+-- Presupuestos: validación y bitácora (alta, modificación con antes/después, baja).
+CREATE TRIGGER trg_presupuestos_bi BEFORE INSERT ON presupuestos FOR EACH ROW
+BEGIN
+  CALL sp_validar_presupuesto(NEW.id, NEW.departamento_id, NEW.fecha_inicio, NEW.fecha_fin, NEW.monto);
+END$$
+
+CREATE TRIGGER trg_presupuestos_bu BEFORE UPDATE ON presupuestos FOR EACH ROW
+BEGIN
+  CALL sp_validar_presupuesto(NEW.id, NEW.departamento_id, NEW.fecha_inicio, NEW.fecha_fin, NEW.monto);
+END$$
+
+CREATE TRIGGER trg_presupuestos_ai AFTER INSERT ON presupuestos FOR EACH ROW
+BEGIN
+  CALL sp_registrar_log('presupuesto_alta', 'presupuesto', NEW.id, @ckl_usuario_id,
+    JSON_OBJECT('departamento', (SELECT nombre FROM departamentos WHERE id = NEW.departamento_id),
+                'fecha_inicio', NEW.fecha_inicio, 'fecha_fin', NEW.fecha_fin, 'monto', NEW.monto,
+                'notas', NEW.notas));
+END$$
+
+CREATE TRIGGER trg_presupuestos_au AFTER UPDATE ON presupuestos FOR EACH ROW
+BEGIN
+  IF NOT (OLD.fecha_inicio <=> NEW.fecha_inicio AND OLD.fecha_fin <=> NEW.fecha_fin
+          AND OLD.monto <=> NEW.monto AND OLD.notas <=> NEW.notas
+          AND OLD.departamento_id <=> NEW.departamento_id) THEN
+    CALL sp_registrar_log('presupuesto_modificacion', 'presupuesto', NEW.id, @ckl_usuario_id,
+      JSON_OBJECT('departamento', (SELECT nombre FROM departamentos WHERE id = NEW.departamento_id),
+                  'antes', JSON_OBJECT('fecha_inicio', OLD.fecha_inicio, 'fecha_fin', OLD.fecha_fin,
+                                       'monto', OLD.monto, 'notas', OLD.notas),
+                  'despues', JSON_OBJECT('fecha_inicio', NEW.fecha_inicio, 'fecha_fin', NEW.fecha_fin,
+                                         'monto', NEW.monto, 'notas', NEW.notas)));
+  END IF;
+END$$
+
+CREATE TRIGGER trg_presupuestos_ad AFTER DELETE ON presupuestos FOR EACH ROW
+BEGIN
+  CALL sp_registrar_log('presupuesto_baja', 'presupuesto', OLD.id, @ckl_usuario_id,
+    JSON_OBJECT('departamento', (SELECT nombre FROM departamentos WHERE id = OLD.departamento_id),
+                'fecha_inicio', OLD.fecha_inicio, 'fecha_fin', OLD.fecha_fin, 'monto', OLD.monto));
 END$$
 
 DELIMITER ;

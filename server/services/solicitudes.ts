@@ -179,7 +179,7 @@ export async function guardarSolicitud(auth: Auth, editId: string | null, raw: u
   if (editId) {
     const s = await one<R>("SELECT * FROM solicitudes WHERE id = ?", [editId]);
     if (!s) throw notFound("La solicitud no existe.");
-    const aut = await one<{ n: number }>("SELECT COUNT(*) n FROM autorizaciones WHERE solicitud_id = ?", [editId]);
+    const aut = await one<{ n: number }>("SELECT COUNT(*) n FROM autorizaciones WHERE solicitud_id = ?", [s.folio]);
     if (s.user_id !== user.id || s.estatus !== "Abierto" || (aut?.n ?? 0) > 0) {
       throw new HttpError(409, "Esa solicitud ya no se puede editar.");
     }
@@ -208,8 +208,8 @@ export async function guardarSolicitud(auth: Auth, editId: string | null, raw: u
           totals.total, requiereFin ? "Pendiente" : "N/A", editId],
         c,
       );
-      await exec("DELETE FROM solicitud_destinos WHERE solicitud_id = ?", [editId], c);
-      await exec("DELETE FROM comprobantes_gasto WHERE solicitud_id = ?", [editId], c);
+      await exec("DELETE FROM solicitud_destinos WHERE solicitud_id = ?", [folio], c);
+      await exec("DELETE FROM comprobantes_gasto WHERE solicitud_id = ?", [folio], c);
     } else {
       await c.query("CALL sp_siguiente_folio(@folio_nuevo)");
       folio = (await one<{ f: string }>("SELECT @folio_nuevo AS f", [], c))!.f;
@@ -231,7 +231,7 @@ export async function guardarSolicitud(auth: Auth, editId: string | null, raw: u
       const dId = d.id && !(await one("SELECT 1 FROM solicitud_destinos WHERE id = ?", [d.id], c)) ? d.id : newId("d_");
       await exec(
         "INSERT INTO solicitud_destinos (id, solicitud_id, estado, fecha_inicio, fecha_fin, gasolina, caseta) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        [dId, solId, d.estado, d.fecha_inicio, d.fecha_fin, d.automovil.gasolina, d.automovil.caseta],
+        [dId, folio, d.estado, d.fecha_inicio, d.fecha_fin, d.automovil.gasolina, d.automovil.caseta],
         c,
       );
       const hotelesOut: DestinoMonto["hoteles"] = [];
@@ -299,8 +299,8 @@ export async function guardarSolicitud(auth: Auth, editId: string | null, raw: u
     ];
     for (const [concepto, m] of renglones) {
       await exec(
-        "INSERT INTO comprobantes_gasto (id, solicitud_id, concepto, monto_solicitado, monto_comprobado, status_renglon) VALUES (?, ?, ?, ?, 0, 'pendiente')",
-        [newId("cg_"), solId, concepto, m],
+        "INSERT INTO comprobantes_gasto (solicitud_id, concepto, monto_solicitado, monto_comprobado, status_renglon) VALUES (?, ?, ?, 0, 'pendiente')",
+        [folio, concepto, m],
         c,
       );
     }
@@ -312,6 +312,13 @@ export async function guardarSolicitud(auth: Auth, editId: string | null, raw: u
   despacharCorreos(resultado.correos);
   const { correos: _correos, ...salida } = resultado;
   return salida;
+}
+
+/** Igual que exigirAlcance pero a partir del FOLIO (las tablas hijas guardan el folio en solicitud_id). */
+export async function exigirAlcancePorFolio(auth: Auth, folio: string) {
+  const s = await one<{ id: string }>("SELECT id FROM solicitudes WHERE folio = ?", [folio]);
+  if (!s) throw notFound("La solicitud no existe.");
+  return exigirAlcance(auth, s.id);
 }
 
 /** Verifica que la solicitud exista y que el usuario pueda verla (para acciones sobre un folio). */

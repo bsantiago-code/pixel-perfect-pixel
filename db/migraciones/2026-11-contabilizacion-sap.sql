@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS factura_desglose (
 
 CREATE TABLE IF NOT EXISTS contabilizaciones (
   id             VARCHAR(40)  NOT NULL,
-  solicitud_id   VARCHAR(40)  NOT NULL,
+  solicitud_id   VARCHAR(10)  NOT NULL COMMENT 'Folio de la solicitud (solicitudes.folio)',
   referencia     VARCHAR(40)  NOT NULL COMMENT 'Folio como texto, sin "#": llave de idempotencia en SAP',
   estado         ENUM('enviando','enviado','error','cancelada') NOT NULL DEFAULT 'enviando',
   modo           VARCHAR(10)  NOT NULL DEFAULT 'simulado' COMMENT 'simulado | real',
@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS contabilizaciones (
   updated_at     DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   PRIMARY KEY (id),
   UNIQUE KEY uq_contab_solicitud (solicitud_id),
-  CONSTRAINT fk_contab_solicitud FOREIGN KEY (solicitud_id) REFERENCES solicitudes (id) ON DELETE CASCADE,
+  CONSTRAINT fk_contab_solicitud FOREIGN KEY (solicitud_id) REFERENCES solicitudes (folio) ON DELETE CASCADE ON UPDATE CASCADE,
   CONSTRAINT fk_contab_usuario   FOREIGN KEY (creado_por)   REFERENCES usuarios (id)    ON DELETE SET NULL
 ) ENGINE=InnoDB COMMENT='Envío a SAP del asiento de un viaje al compensarlo';
 

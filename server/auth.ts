@@ -22,6 +22,7 @@ export type AuthUser = {
   initials: string;
   /** false = "No Autorizado para Viajar": puede entrar al portal pero no crear solicitudes. */
   autorizado_viajar: boolean;
+  departamento_id: number | null;
 };
 export type AuthRole = { id: number; nombre: string; permisos: Record<string, boolean> };
 export type Auth = { user: AuthUser; role: AuthRole };
@@ -54,7 +55,7 @@ export async function verifyPassword(stored: string, plain: string): Promise<boo
 }
 
 // ───────── usuarios / roles ─────────
-const USER_COLS = "id, nombre, correo, rfc, rol_id, empresa, jefe_id, activo, initials, autorizado_viajar";
+const USER_COLS = "id, nombre, correo, rfc, rol_id, empresa, jefe_id, activo, initials, autorizado_viajar, departamento_id";
 
 export function toAuthUser(r: Record<string, unknown>): AuthUser {
   return {
@@ -68,6 +69,7 @@ export function toAuthUser(r: Record<string, unknown>): AuthUser {
     activo: !!r.activo,
     initials: String(r.initials ?? ""),
     autorizado_viajar: r.autorizado_viajar === undefined ? true : !!r.autorizado_viajar,
+    departamento_id: r.departamento_id == null ? null : Number(r.departamento_id),
   };
 }
 

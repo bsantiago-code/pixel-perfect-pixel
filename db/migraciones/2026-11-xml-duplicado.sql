@@ -28,7 +28,7 @@ PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 -- XML repetidos que ya existan (si aparece alguna fila, el índice no se crea).
 SELECT f.uuid_xml AS uuid_repetido, COUNT(*) AS veces, GROUP_CONCAT(s.folio ORDER BY s.folio) AS folios
-  FROM facturas f JOIN solicitudes s ON s.id = f.solicitud_id
+  FROM facturas f JOIN solicitudes s ON s.folio = f.solicitud_id
  WHERE f.uuid_xml IS NOT NULL
  GROUP BY f.uuid_xml
 HAVING COUNT(*) > 1;

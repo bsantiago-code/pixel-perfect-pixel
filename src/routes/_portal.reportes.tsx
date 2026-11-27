@@ -42,7 +42,7 @@ function Reportes() {
   const userName = (id: string) => users.find((u) => u.id === id)?.nombre ?? "—";
   // Etiqueta visible (Pendiente/Autorizado/Comprobado/Rechazado); s.estatus guardado no cambia.
   const etiqueta = (s: Solicitud) =>
-    estatusVisible(s.estatus, avanceComprobacion(comprobantes, s.id, false, depositos).completo);
+    estatusVisible(s.estatus, avanceComprobacion(comprobantes, s.folio, false, depositos).completo);
 
   const search = () => {
     const r = visibleSolicitudes.filter((s) => {
@@ -149,7 +149,7 @@ function Reportes() {
             <li key={s.id} className="p-3">
               <div className="flex items-center justify-between gap-2">
                 <span className="font-mono text-xs font-semibold">{s.folio}</span>
-                <StatusBadge estatus={s.estatus} comprobado={avanceComprobacion(comprobantes, s.id, false, depositos).completo} />
+                <StatusBadge estatus={s.estatus} comprobado={avanceComprobacion(comprobantes, s.folio, false, depositos).completo} />
               </div>
               <div className="mt-1 flex items-baseline justify-between gap-2">
                 <span className="truncate text-sm font-medium">{userName(s.user_id)}</span>
@@ -179,7 +179,7 @@ function Reportes() {
                   <td className="p-3 text-xs">{s.destino_resumen}</td>
                   <td className="p-3 text-right font-semibold">{fmtMoney(s.monto_total)}</td>
                   <td className="p-3"><span className="ckl-badge" style={{ background: s.vencimiento === "Vencido" ? "#FEE9EA" : "#D8F3DC", color: s.vencimiento === "Vencido" ? "#E30613" : "#2D6A4F" }}>{s.vencimiento}</span></td>
-                  <td className="p-3"><StatusBadge estatus={s.estatus} comprobado={avanceComprobacion(comprobantes, s.id, false, depositos).completo} /></td>
+                  <td className="p-3"><StatusBadge estatus={s.estatus} comprobado={avanceComprobacion(comprobantes, s.folio, false, depositos).completo} /></td>
                 </tr>
               ))}
               {enriched.length === 0 && <tr><td colSpan={8} className="p-8 text-center text-xs text-muted-foreground">Sin resultados</td></tr>}

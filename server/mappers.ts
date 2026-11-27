@@ -42,10 +42,10 @@ export function solicitudOut(r: R) {
 
 export function autorizacionOut(r: R) {
   return {
-    id: r.id,
-    solicitud_id: r.solicitud_id,
+    solicitud_id: r.solicitud_id, // folio
     rol_autorizador: r.rol_autorizador,
     user_id: r.user_id,
+    user_nombre: r.user_nombre,
     status: r.status,
     fecha: day(r.fecha),
     nota: r.nota ?? "",
@@ -54,8 +54,7 @@ export function autorizacionOut(r: R) {
 
 export function comprobanteOut(r: R) {
   const out: R = {
-    id: r.id,
-    solicitud_id: r.solicitud_id,
+    solicitud_id: r.solicitud_id, // folio
     concepto: r.concepto,
     monto_solicitado: r.monto_solicitado,
     monto_comprobado: r.monto_comprobado,
@@ -81,7 +80,7 @@ export function facturaOut(r: R) {
     archivo: r.archivo,
     total: r.total,
     status: r.status,
-    concepto_id: r.concepto_id ?? null,
+    concepto: r.concepto ?? null, // renglón: (solicitud_id, concepto)
     monto_aplicado: r.monto_aplicado,
     par_id: r.par_id ?? undefined,
     sat_estado: r.sat_estado ?? null,
@@ -211,11 +210,15 @@ export const correoOut = (r: R) => ({
   detalle_error: r.detalle_error ?? undefined,
 });
 
-/** Destinos de las solicitudes indicadas, con hoteles/transportes/vales anidados (forma de DestinoStored). */
+/**
+ * Destinos de las solicitudes indicadas (por id interno), con hoteles/transportes/vales anidados (forma de
+ * DestinoStored). En la salida `solicitud_id` es el folio, como en la tabla.
+ */
 export async function destinosDe(solicitudIds: string[], db?: Db) {
   if (!solicitudIds.length) return [];
   const ds = await rows<R>(
-    "SELECT * FROM solicitud_destinos WHERE solicitud_id IN (?) ORDER BY fecha_inicio, id",
+    `SELECT d.* FROM solicitud_destinos d JOIN solicitudes s ON s.folio = d.solicitud_id
+      WHERE s.id IN (?) ORDER BY d.fecha_inicio, d.id`,
     [solicitudIds],
     db,
   );

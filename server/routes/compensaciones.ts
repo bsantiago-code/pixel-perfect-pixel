@@ -41,15 +41,15 @@ export function compensacionOut(r: R) {
   };
 }
 
-/** Lanza 409 si el folio ya fue compensado: sus facturas y validaciones quedan congeladas. */
-export async function exigirNoCompensado(solicitudId: string, db?: Db) {
-  const c = await one("SELECT 1 FROM compensaciones WHERE solicitud_id = ?", [solicitudId], db);
+/** Lanza 409 si el folio ya fue compensado: sus facturas y validaciones quedan congeladas. Recibe el FOLIO. */
+export async function exigirNoCompensado(folio: string, db?: Db) {
+  const c = await one("SELECT 1 FROM compensaciones WHERE solicitud_id = ?", [folio], db);
   if (c) throw new HttpError(409, "Este viaje ya fue compensado: ya no se pueden modificar sus comprobantes.");
   // Un envío a SAP en curso (o ya confirmado) congela el folio: lo contabilizado debe coincidir con sus facturas.
   const k = await one(
     `SELECT 1 FROM contabilizaciones WHERE solicitud_id = ?
         AND (estado = 'enviado' OR (estado = 'enviando' AND TIMESTAMPDIFF(SECOND, updated_at, NOW(3)) < ?))`,
-    [solicitudId, ENVIO_VIGENTE_SEG],
+    [folio, ENVIO_VIGENTE_SEG],
     db,
   );
   if (k) throw new HttpError(409, "Este viaje se está contabilizando en SAP: ya no se pueden modificar sus comprobantes.");
@@ -59,19 +59,19 @@ export async function exigirNoCompensado(solicitudId: string, db?: Db) {
  * Resumen por concepto: solicitado, comprobado (lo aplicado, con tope en lo solicitado), facturado (suma de los
  * totales de las facturas XML; en vales, lo aplicado) y excedente = facturado − comprobado.
  */
-export async function resumenCompensacion(solicitudId: string, db?: Db) {
+export async function resumenCompensacion(folio: string, db?: Db) {
   const renglones = await rows<R>(
-    `SELECT cg.id, cg.concepto, cg.monto_solicitado, cg.monto_comprobado, cg.validado,
+    `SELECT cg.concepto, cg.monto_solicitado, cg.monto_comprobado, cg.validado,
             -- XML: su Total completo. Vales (foto/PDF sin XML): solo lo aplicado, porque su importe aún es
             -- simulado y no debe generar excedente. El PDF de un par aplica 0.
             COALESCE(SUM(CASE WHEN f.tipo = 'XML' AND f.status <> 'Incompleto' THEN f.total
                               ELSE f.monto_aplicado END), 0) AS facturado
        FROM comprobantes_gasto cg
-       LEFT JOIN facturas f ON f.concepto_id = cg.id
+       LEFT JOIN facturas f ON f.solicitud_id = cg.solicitud_id AND f.concepto = cg.concepto
       WHERE cg.solicitud_id = ?
-      GROUP BY cg.id, cg.concepto, cg.monto_solicitado, cg.monto_comprobado, cg.validado
-      ORDER BY cg.id`,
-    [solicitudId],
+      GROUP BY cg.solicitud_id, cg.concepto, cg.seq, cg.monto_solicitado, cg.monto_comprobado, cg.validado
+      ORDER BY cg.seq`,
+    [folio],
     db,
   );
   const conceptos = renglones
@@ -81,7 +81,6 @@ export async function resumenCompensacion(solicitudId: string, db?: Db) {
       const comprobado = n(r.monto_comprobado);
       const facturado = n(r.facturado);
       return {
-        id: String(r.id),
         concepto: String(r.concepto),
         solicitado,
         comprobado,
@@ -93,7 +92,7 @@ export async function resumenCompensacion(solicitudId: string, db?: Db) {
   const suma = (k: "solicitado" | "comprobado" | "facturado" | "excedente") =>
     redondear(conceptos.reduce((a, c) => a + c[k], 0));
   // Depósito sobrante: tabla aparte; suma al comprobado del folio (no a un concepto).
-  const dep = await one<R>("SELECT COALESCE(SUM(monto), 0) AS total FROM depositos_sobrante WHERE solicitud_id = ?", [solicitudId], db);
+  const dep = await one<R>("SELECT COALESCE(SUM(monto), 0) AS total FROM depositos_sobrante WHERE solicitud_id = ?", [folio], db);
   const depositos = redondear(n(dep?.total));
   const comprobadoTotal = redondear(suma("comprobado") + depositos);
   return {
@@ -117,7 +116,7 @@ compensacionesRouter.get("/compensaciones", async (req, res) => {
   const list = await rows<R>(
     `SELECT c.*, k.documento_sap
        FROM compensaciones c
-       JOIN solicitudes s ON s.id = c.solicitud_id
+       JOIN solicitudes s ON s.folio = c.solicitud_id
        LEFT JOIN contabilizaciones k ON k.solicitud_id = c.solicitud_id AND k.estado = 'enviado'
       WHERE ${alcance.sql}`,
     alcance.params,
@@ -127,15 +126,15 @@ compensacionesRouter.get("/compensaciones", async (req, res) => {
 
 // Resumen para el diálogo "Compensar viaje" y para el detalle del folio.
 compensacionesRouter.get("/solicitudes/:id/compensacion", async (req, res) => {
-  await exigirAlcance(me(req), String(req.params.id));
+  const sol = await exigirAlcance(me(req), String(req.params.id));
   const c = await one<R>(
     `SELECT c.*, k.documento_sap FROM compensaciones c
        LEFT JOIN contabilizaciones k ON k.solicitud_id = c.solicitud_id AND k.estado = 'enviado'
       WHERE c.solicitud_id = ?`,
-    [req.params.id],
+    [sol.folio],
   );
   res.json({
-    resumen: await resumenCompensacion(String(req.params.id)),
+    resumen: await resumenCompensacion(String(sol.folio)),
     compensacion: c ? compensacionOut(c) : null,
   });
 });
@@ -143,12 +142,12 @@ compensacionesRouter.get("/solicitudes/:id/compensacion", async (req, res) => {
 // Vista previa del asiento que se enviará a SAP al compensar (y estado del último envío). Con la contabilización
 // apagada solo avisa que está apagada.
 compensacionesRouter.get("/solicitudes/:id/contabilizacion", requirePerm("compensar_viaje"), async (req, res) => {
-  const solicitudId = String(req.params.id);
-  await exigirAlcance(me(req), solicitudId);
+  const sol = await exigirAlcance(me(req), String(req.params.id));
+  const folio = String(sol.folio); // las tablas hijas guardan el folio
   const cfg = await loadConfig();
   const k = await one<R>(
     "SELECT estado, documento_sap, error, intentos, enviado_at FROM contabilizaciones WHERE solicitud_id = ?",
-    [solicitudId],
+    [folio],
   );
   const envio = k
     ? { estado: k.estado, documento_sap: k.documento_sap ?? null, error: k.error ?? null, intentos: n(k.intentos), enviado_at: iso(k.enviado_at) ?? null }
@@ -156,7 +155,7 @@ compensacionesRouter.get("/solicitudes/:id/contabilizacion", requirePerm("compen
   if (!contabilizacionActiva(cfg)) {
     return res.json({ activo: false, modo: modoSap(cfg), envio });
   }
-  const a = await construirAsiento(solicitudId);
+  const a = await construirAsiento(folio);
   res.json({ ...a, envio });
 });
 
@@ -194,10 +193,10 @@ async function registrarCompensacion(
 ) {
   const sol = await one<R>("SELECT id FROM solicitudes WHERE id = ? FOR UPDATE", [p.solicitudId], c);
   if (!sol) throw new HttpError(404, "La solicitud no existe.");
-  if (await one("SELECT 1 FROM compensaciones WHERE solicitud_id = ?", [p.solicitudId], c)) {
+  if (await one("SELECT 1 FROM compensaciones WHERE solicitud_id = ?", [p.folio], c)) {
     throw new HttpError(409, `El viaje ${p.folio} ya fue compensado.`);
   }
-  const r = await resumenCompensacion(p.solicitudId, c);
+  const r = await resumenCompensacion(String(p.folio), c);
   if (!r.comprobadoCompleto) throw new HttpError(409, "El viaje aún no está comprobado al 100 %.");
   if (!r.validadoCompleto) throw new HttpError(409, "Compras aún no valida todos los conceptos del viaje.");
   const { comentario, reembolso } = decidirExcedente(p.body, r);
@@ -207,7 +206,7 @@ async function registrarCompensacion(
     `INSERT INTO compensaciones (id, solicitud_id, decision, monto_solicitado, monto_comprobado, monto_excedente,
                                  monto_reembolso, comentario, compensado_por)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [id, p.solicitudId, p.body.decision, r.solicitado, r.comprobado, r.excedente, reembolso, comentario, p.userId],
+    [id, p.folio, p.body.decision, r.solicitado, r.comprobado, r.excedente, reembolso, comentario, p.userId],
     c,
   );
   await (c as unknown as { query: (sql: string, v: unknown[]) => Promise<unknown> }).query(
@@ -241,6 +240,7 @@ compensacionesRouter.post(
       .parse(req.body);
     const solicitudId = String(req.params.id);
     const sol = await exigirAlcance(auth, solicitudId);
+    const folio = String(sol.folio); // compensaciones, contabilizaciones y demás tablas hijas guardan el folio
     if (sol.estatus !== "Cerrado") throw new HttpError(409, "Solo se compensan viajes autorizados.");
 
     const cfg = await loadConfig();
@@ -254,27 +254,27 @@ compensacionesRouter.post(
     }
 
     // 1. Validaciones previas (sin bloquear nada) y asiento.
-    if (await one("SELECT 1 FROM compensaciones WHERE solicitud_id = ?", [solicitudId])) {
+    if (await one("SELECT 1 FROM compensaciones WHERE solicitud_id = ?", [folio])) {
       throw new HttpError(409, `El viaje ${sol.folio} ya fue compensado.`);
     }
-    const resumen = await resumenCompensacion(solicitudId);
+    const resumen = await resumenCompensacion(folio);
     if (!resumen.comprobadoCompleto) throw new HttpError(409, "El viaje aún no está comprobado al 100 %.");
     if (!resumen.validadoCompleto) throw new HttpError(409, "Compras aún no valida todos los conceptos del viaje.");
     decidirExcedente(body, resumen);
-    const asiento = await construirAsiento(solicitudId);
+    const asiento = await construirAsiento(folio);
     if (asiento.bloqueos.length) throw new HttpError(409, asiento.bloqueos.join(" "));
     const modo = modoSap(cfg);
 
     // 2. Reservar el envío (una sola contabilización por folio).
     const reserva = await tx(async (c) => {
       await one("SELECT id FROM solicitudes WHERE id = ? FOR UPDATE", [solicitudId], c);
-      if (await one("SELECT 1 FROM compensaciones WHERE solicitud_id = ?", [solicitudId], c)) {
+      if (await one("SELECT 1 FROM compensaciones WHERE solicitud_id = ?", [folio], c)) {
         throw new HttpError(409, `El viaje ${sol.folio} ya fue compensado.`);
       }
       const prev = await one<R>(
         `SELECT id, estado, documento_sap, TIMESTAMPDIFF(SECOND, updated_at, NOW(3)) AS antiguedad
            FROM contabilizaciones WHERE solicitud_id = ? FOR UPDATE`,
-        [solicitudId],
+        [folio],
         c,
       );
       if (prev) {
@@ -295,7 +295,7 @@ compensacionesRouter.post(
       await exec(
         `INSERT INTO contabilizaciones (id, solicitud_id, referencia, estado, modo, payload, intentos, creado_por)
          VALUES (?, ?, ?, 'enviando', ?, CAST(? AS JSON), 1, ?)`,
-        [id, solicitudId, asiento.payload.referencia, modo, JSON.stringify(asiento.payload), auth.user.id],
+        [id, folio, asiento.payload.referencia, modo, JSON.stringify(asiento.payload), auth.user.id],
         c,
       );
       return { id, documento: "" };

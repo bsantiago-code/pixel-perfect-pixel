@@ -38,18 +38,18 @@ export function cuentasDeConfig(cfg: Record<string, unknown>): Cuentas {
 export const contabilizacionActiva = (cfg: Record<string, unknown>) => cfg.sap_contabilizacion_activa === true;
 export const modoSap = (cfg: Record<string, unknown>): ModoSap => (cfg.sap_modo === "real" ? "real" : "simulado");
 
-/** Facturas XML del folio con su desglose (lo rellena si falta). */
-export async function facturasContables(solicitudId: string, db?: Db) {
+/** Facturas XML del folio con su desglose (lo rellena si falta). `folio` = Solicitud.folio (solicitud_id de las tablas hijas). */
+export async function facturasContables(folio: string, db?: Db) {
   const list = await rows<R>(
     `SELECT f.id, f.uuid, f.archivo, f.ruta, cg.concepto, d.detalle,
             CASE WHEN d.factura_id IS NULL THEN a.contenido END AS contenido
        FROM facturas f
-       JOIN comprobantes_gasto cg ON cg.id = f.concepto_id
+       JOIN comprobantes_gasto cg ON cg.solicitud_id = f.solicitud_id AND cg.concepto = f.concepto
        LEFT JOIN factura_desglose d ON d.factura_id = f.id
        LEFT JOIN factura_archivos a ON a.factura_id = f.id
       WHERE f.solicitud_id = ? AND f.tipo = 'XML'
       ORDER BY f.created_at, f.id`,
-    [solicitudId],
+    [folio],
     db,
   );
   const facturas: FacturaContable[] = [];
@@ -84,22 +84,22 @@ export type Asiento = ResultadoPayload & {
   bloqueos: string[];
 };
 
-/** Asiento del folio + qué impide enviarlo. En modo simulado las cuentas faltantes no bloquean. */
-export async function construirAsiento(solicitudId: string, db?: Db): Promise<Asiento> {
-  const sol = await one<R>("SELECT * FROM solicitudes WHERE id = ?", [solicitudId], db);
+/** Asiento del folio + qué impide enviarlo. En modo simulado las cuentas faltantes no bloquean. Recibe el FOLIO. */
+export async function construirAsiento(folio: string, db?: Db): Promise<Asiento> {
+  const sol = await one<R>("SELECT * FROM solicitudes WHERE folio = ?", [folio], db);
   if (!sol) throw new HttpError(404, "La solicitud no existe.");
   const cfg = await loadConfig();
   const modo = modoSap(cfg);
   const [soc, usr, sat] = await Promise.all([
     one<R>("SELECT rfc FROM sociedades WHERE nombre = ?", [sol.empresa], db),
     one<R>("SELECT id, nombre FROM usuarios WHERE id = ?", [sol.user_id], db),
-    one<R>("SELECT COUNT(*) AS n FROM facturas WHERE solicitud_id = ? AND tipo = 'XML' AND sat_estado = 'Pendiente'", [solicitudId], db),
+    one<R>("SELECT COUNT(*) AS n FROM facturas WHERE solicitud_id = ? AND tipo = 'XML' AND sat_estado = 'Pendiente'", [folio], db),
   ]);
-  const { facturas, ilegibles } = await facturasContables(solicitudId, db);
+  const { facturas, ilegibles } = await facturasContables(folio, db);
   const hoy = new Date();
   const fecha = `${hoy.getFullYear()}-${String(hoy.getMonth() + 1).padStart(2, "0")}-${String(hoy.getDate()).padStart(2, "0")}`;
   const r = armarPayloadSap({
-    folio: String(sol.folio),
+    folio,
     empresa: String(sol.empresa),
     rfcSociedad: soc?.rfc ? String(soc.rfc) : undefined,
     fecha,

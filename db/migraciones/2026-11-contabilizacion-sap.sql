@@ -52,6 +52,19 @@ CREATE TABLE IF NOT EXISTS contabilizaciones (
   CONSTRAINT fk_contab_usuario   FOREIGN KEY (creado_por)   REFERENCES usuarios (id)    ON DELETE SET NULL
 ) ENGINE=InnoDB COMMENT='Envío a SAP del asiento de un viaje al compensarlo';
 
+
+-- Si la tabla se creó con una versión anterior de esta migración (solicitud_id = id interno), se convierte al folio.
+SET @viejo := (SELECT COUNT(*) FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'contabilizaciones' AND COLUMN_NAME = 'solicitud_id' AND CHARACTER_MAXIMUM_LENGTH > 10);
+SET @sql := IF(@viejo > 0, 'ALTER TABLE contabilizaciones DROP FOREIGN KEY fk_contab_solicitud', 'DO 0');
+PREPARE st FROM @sql; EXECUTE st; DEALLOCATE PREPARE st;
+SET @sql := IF(@viejo > 0, 'UPDATE contabilizaciones t JOIN solicitudes s ON s.id = t.solicitud_id SET t.solicitud_id = s.folio', 'DO 0');
+PREPARE st FROM @sql; EXECUTE st; DEALLOCATE PREPARE st;
+SET @sql := IF(@viejo > 0, 'ALTER TABLE contabilizaciones MODIFY COLUMN solicitud_id VARCHAR(10) NOT NULL COMMENT ''Folio de la solicitud (solicitudes.folio)''', 'DO 0');
+PREPARE st FROM @sql; EXECUTE st; DEALLOCATE PREPARE st;
+SET @sql := IF(@viejo > 0, 'ALTER TABLE contabilizaciones ADD CONSTRAINT fk_contab_solicitud FOREIGN KEY (solicitud_id) REFERENCES solicitudes (folio) ON DELETE CASCADE ON UPDATE CASCADE', 'DO 0');
+PREPARE st FROM @sql; EXECUTE st; DEALLOCATE PREPARE st;
+
 INSERT INTO configuracion (clave, valor) VALUES
   ('sap_contabilizacion_activa', 'false'),
   ('sap_modo', '"simulado"'),

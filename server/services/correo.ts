@@ -3,7 +3,7 @@
 // después de guardar la solicitud, fuera de la transacción: un fallo del SMTP nunca rompe el flujo.
 import nodemailer from "nodemailer";
 
-import { exec, one, rows } from "../db.ts";
+import { exec, newId, one, rows, type Db } from "../db.ts";
 import { descifrarSecreto, esCifrado } from "../secretos.ts";
 
 export type SmtpCfg = {
@@ -118,6 +118,45 @@ export async function enviarCorreo(
     transporte.close();
   }
   return { remitente: textoRemitente(cfg) };
+}
+
+/**
+ * Estado con el que se registra un correo nuevo según la configuración actual:
+ *  omitido = correos desactivados · simulado = no hay servidor SMTP · pendiente = se enviará al terminar la transacción.
+ */
+export async function estadoCorreoActual(db: Db): Promise<"omitido" | "simulado" | "pendiente"> {
+  const cfg = await rows<{ clave: string; valor: unknown }>(
+    "SELECT clave, valor FROM configuracion WHERE clave IN ('notif_email_activo', 'smtp_servidor')",
+    [],
+    db,
+  );
+  const valor = (k: string) => cfg.find((r) => r.clave === k)?.valor;
+  const activo = valor("notif_email_activo") === undefined || String(valor("notif_email_activo")) !== "false";
+  const hayServidor = typeof valor("smtp_servidor") === "string" && String(valor("smtp_servidor")).trim() !== "";
+  return !activo ? "omitido" : hayServidor ? "pendiente" : "simulado";
+}
+
+/**
+ * Registra en `correos` un mismo mensaje para varios destinatarios (dentro de la transacción `db`) y devuelve los ids
+ * `pendiente`: pásalos a despacharCorreos() DESPUÉS de confirmar la transacción.
+ */
+export async function encolarCorreos(
+  db: Db,
+  m: { destinatarios: { id: string; correo: string }[]; asunto: string; cuerpo: string; referencia: string },
+): Promise<string[]> {
+  const estado = await estadoCorreoActual(db);
+  const pendientes: string[] = [];
+  for (const d of m.destinatarios) {
+    const id = newId("mail_");
+    await exec(
+      `INSERT INTO correos (id, fecha, para, usuario_id, asunto, cuerpo, referencia, estado)
+       VALUES (?, NOW(3), ?, ?, ?, ?, ?, ?)`,
+      [id, d.correo, d.id, m.asunto, m.cuerpo, m.referencia, estado],
+      db,
+    );
+    if (estado === "pendiente") pendientes.push(id);
+  }
+  return pendientes;
 }
 
 /** Despacha en segundo plano los correos `pendiente`; deja `enviado` o `error` (con el motivo) en cada fila. */

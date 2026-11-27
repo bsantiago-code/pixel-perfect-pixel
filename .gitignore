@@ -33,3 +33,4 @@ dist-ssr
 
 # Archivos de prueba locales (XML/PDF de ejemplo)
 pruebas/
+src/routeTree.gen.ts

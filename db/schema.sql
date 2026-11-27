@@ -39,7 +39,8 @@ DROP PROCEDURE IF EXISTS sp_reactivar_convenio;
 DROP PROCEDURE IF EXISTS sp_gasto_por_concepto;
 DROP PROCEDURE IF EXISTS sp_validar_presupuesto;
 
-DROP TABLE IF EXISTS presupuestos, compensaciones, logs, correos, revisiones_monto, convenios, factura_archivos, facturas,
+DROP TABLE IF EXISTS contabilizaciones, factura_desglose, deposito_archivos, depositos_sobrante, presupuestos,
+  compensaciones, logs, correos, revisiones_monto, convenios, factura_archivos, facturas,
   comprobantes_gasto, notas, autorizaciones, destino_vales, destino_transportes, destino_hoteles,
   solicitud_destinos, solicitudes, sesiones, reset_codes, prealtas, usuarios, folio_contador,
   configuracion, estados_mx, origenes, hoteles, sociedades, departamentos, roles;
@@ -126,6 +127,7 @@ CREATE TABLE usuarios (
   empresa   VARCHAR(120) NOT NULL,
   jefe_id   VARCHAR(40)  NULL,
   activo    TINYINT(1)   NOT NULL DEFAULT 1,
+  autorizado_viajar TINYINT(1) NOT NULL DEFAULT 1 COMMENT '0 = "No Autorizado para Viajar" (pre-registro): no puede crear solicitudes hasta que su jefe inmediato lo habilite',
   initials  VARCHAR(4)   NOT NULL DEFAULT '',
   departamento_id INT    NULL COMMENT 'Departamento cuyo presupuesto descuentan sus viajes',
   PRIMARY KEY (id),
@@ -148,7 +150,8 @@ CREATE TABLE prealtas (
   clabe       VARCHAR(18)  NULL,
   sociedad    VARCHAR(120) NULL,
   password    VARCHAR(255) NOT NULL COMMENT 'Hash scrypt (scrypt$salt$hash); nunca en claro',
-  status      VARCHAR(20)  NOT NULL DEFAULT 'pendiente',
+  status      VARCHAR(20)  NOT NULL DEFAULT 'pendiente' COMMENT 'acceso_otorgado: la cuenta se crea al pre-registrarse',
+  usuario_id  VARCHAR(40)  NULL COMMENT 'Cuenta creada con este pre-registro',
   created_at  DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   PRIMARY KEY (id),
   KEY ix_prealtas_status (status)
@@ -310,7 +313,9 @@ CREATE TABLE facturas (
   monto_aplicado  DECIMAL(12,2) NOT NULL DEFAULT 0 COMMENT 'Solo el XML aplica monto; permite revertir exacto',
   par_id          VARCHAR(80)   NULL COMMENT 'Comparten par_id el XML y el PDF de un mismo comprobante',
   ruta            VARCHAR(500)  NULL COMMENT 'Archivo en almacenamiento externo: drive:<fileId> o local:<ruta>. NULL = el contenido está en factura_archivos',
-  created_at      DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  sat_estado      VARCHAR(20)   NULL COMMENT 'Estado del CFDI ante el SAT al subirlo (XML): Vigente | Pendiente (SAT sin respuesta) | NULL (no consultado)',
+  sat_verificado_en DATETIME    NULL COMMENT 'Cuándo se consultó al SAT',
+  created_at     DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   uuid_xml        VARCHAR(60)   GENERATED ALWAYS AS (IF(tipo = 'XML' AND uuid <> '', uuid, NULL)) VIRTUAL
                   COMMENT 'UUID fiscal solo en los XML: el índice único impide comprobar dos veces la misma factura',
   PRIMARY KEY (id),
@@ -329,6 +334,64 @@ CREATE TABLE factura_archivos (
   PRIMARY KEY (factura_id),
   CONSTRAINT fk_farch_factura FOREIGN KEY (factura_id) REFERENCES facturas (id) ON DELETE CASCADE
 ) ENGINE=InnoDB COMMENT='Contenido en BD (solo con STORAGE_DRIVER=db o sin migrar); con Drive/carpeta local no hay fila aquí';
+
+-- Depósito sobrante: fichas de depósito del sobrante de viáticos. Suman al comprobado del folio (aún sin SAP).
+CREATE TABLE depositos_sobrante (
+  id            VARCHAR(40)   NOT NULL,
+  solicitud_id  VARCHAR(10)   NOT NULL COMMENT 'Folio de la solicitud (solicitudes.folio)',
+  monto         DECIMAL(12,2) NOT NULL,
+  archivo       VARCHAR(255)  NOT NULL,
+  ruta          VARCHAR(500)  NULL COMMENT 'Archivo en almacenamiento externo: drive:<fileId> o local:<ruta>. NULL = el contenido está en deposito_archivos',
+  creado_por    VARCHAR(40)   NULL,
+  created_at    DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (id),
+  KEY ix_depositos_solicitud (solicitud_id),
+  CONSTRAINT fk_dep_solicitud FOREIGN KEY (solicitud_id) REFERENCES solicitudes (folio) ON DELETE CASCADE ON UPDATE CASCADE,
+  CONSTRAINT fk_dep_usuario   FOREIGN KEY (creado_por)   REFERENCES usuarios (id)    ON DELETE SET NULL
+) ENGINE=InnoDB COMMENT='Fichas de depósito del sobrante de viáticos; suman al comprobado del folio';
+
+CREATE TABLE deposito_archivos (
+  deposito_id VARCHAR(40)  NOT NULL,
+  mime        VARCHAR(100) NOT NULL,
+  contenido   LONGBLOB     NOT NULL,
+  PRIMARY KEY (deposito_id),
+  CONSTRAINT fk_darch_deposito FOREIGN KEY (deposito_id) REFERENCES depositos_sobrante (id) ON DELETE CASCADE
+) ENGINE=InnoDB COMMENT='Contenido en BD (solo con STORAGE_DRIVER=db); con Drive/carpeta local no hay fila aquí';
+
+-- Contabilización a SAP al compensar el viaje (desglose del XML y envío por folio).
+CREATE TABLE factura_desglose (
+  factura_id   VARCHAR(40)   NOT NULL COMMENT 'Fila XML de facturas',
+  moneda       VARCHAR(3)    NOT NULL DEFAULT 'MXN',
+  tipo_cambio  DECIMAL(12,6) NULL,
+  subtotal     DECIMAL(14,2) NOT NULL DEFAULT 0,
+  descuento    DECIMAL(14,2) NOT NULL DEFAULT 0,
+  total        DECIMAL(14,2) NOT NULL DEFAULT 0,
+  detalle      JSON          NOT NULL COMMENT 'Conceptos con sus traslados y retenciones, y los impuestos del comprobante',
+  created_at   DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (factura_id),
+  CONSTRAINT fk_fdes_factura FOREIGN KEY (factura_id) REFERENCES facturas (id) ON DELETE CASCADE
+) ENGINE=InnoDB COMMENT='Desglose contable del CFDI (insumo del asiento a SAP)';
+
+CREATE TABLE contabilizaciones (
+  id             VARCHAR(40)  NOT NULL,
+  solicitud_id   VARCHAR(10)  NOT NULL COMMENT 'Folio de la solicitud (solicitudes.folio)',
+  referencia     VARCHAR(40)  NOT NULL COMMENT 'Folio como texto, sin "#": llave de idempotencia en SAP',
+  estado         ENUM('enviando','enviado','error','cancelada') NOT NULL DEFAULT 'enviando',
+  modo           VARCHAR(10)  NOT NULL DEFAULT 'simulado' COMMENT 'simulado | real',
+  payload        JSON         NOT NULL COMMENT 'Asiento enviado a SAP',
+  respuesta      JSON         NULL,
+  documento_sap  VARCHAR(60)  NULL COMMENT 'Número de documento contable que devolvió SAP',
+  error          TEXT         NULL,
+  intentos       INT          NOT NULL DEFAULT 0,
+  creado_por     VARCHAR(40)  NULL,
+  created_at     DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  enviado_at     DATETIME(3)  NULL,
+  updated_at     DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_contab_solicitud (solicitud_id),
+  CONSTRAINT fk_contab_solicitud FOREIGN KEY (solicitud_id) REFERENCES solicitudes (folio) ON DELETE CASCADE ON UPDATE CASCADE,
+  CONSTRAINT fk_contab_usuario   FOREIGN KEY (creado_por)   REFERENCES usuarios (id)    ON DELETE SET NULL
+) ENGINE=InnoDB COMMENT='Envío a SAP del asiento de un viaje al compensarlo';
 
 -- Compras Corporativas: convenios y revisiones ---------------------------
 CREATE TABLE convenios (
@@ -590,6 +653,11 @@ INSERT INTO configuracion (clave, valor) VALUES
   ('notif_plataforma_activo', 'true'),
   ('revision_automatica_activo', 'true'),
   ('bloquear_folio_monto_hotel', 'false'),
+  ('sat_validacion_activa', 'true'),
+  -- Contabilización a SAP al compensar (Configuración → Contabilización a SAP). Apagada por omisión.
+  ('sap_contabilizacion_activa', 'false'),
+  ('sap_modo', '"simulado"'),
+  ('sap_cuentas', '{}'),
   -- Presupuestos por departamento: true = no se autoriza un folio que exceda el disponible de su bolsa.
   ('bloquear_autorizacion_sin_presupuesto', 'false'),
   -- Palabras que rechazan una factura al subirla (Configuración → Productos no permitidos en facturas).
@@ -1368,27 +1436,32 @@ BEGIN
   COMMIT;
 END$$
 
--- Equivale a avanceComprobacion(): p_solo_avion = 1 limita el cálculo al concepto "Avión" (gestor de vuelos).
+-- Equivale a avanceComprobacion(): p_solo_avion = 1 limita el cálculo al concepto "Avión" (gestor de vuelos);
+-- los depósitos sobrantes del folio suman al comprobado (no aplican con p_solo_avion).
 CREATE PROCEDURE sp_recalcular_comprobacion(IN p_solicitud_id VARCHAR(40), IN p_solo_avion TINYINT(1))
 BEGIN
   DECLARE v_folio VARCHAR(10);
+  DECLARE v_dep DECIMAL(12,2) DEFAULT 0;
   SELECT folio INTO v_folio FROM solicitudes WHERE id = p_solicitud_id;
+  IF p_solo_avion = 0 THEN
+    SELECT COALESCE(SUM(monto), 0) INTO v_dep FROM depositos_sobrante WHERE solicitud_id = v_folio;
+  END IF;
 
   SELECT v_folio AS solicitud_id,
          COALESCE(SUM(monto_solicitado), 0) AS solicitado,
-         COALESCE(SUM(monto_comprobado), 0) AS comprobado,
+         COALESCE(SUM(monto_comprobado), 0) + v_dep AS comprobado,
          (COALESCE(SUM(monto_solicitado), 0) > 0
-            AND COALESCE(SUM(monto_comprobado), 0) = COALESCE(SUM(monto_solicitado), 0)) AS completo,
+            AND COALESCE(SUM(monto_comprobado), 0) + v_dep = COALESCE(SUM(monto_solicitado), 0)) AS completo,
          CASE WHEN COALESCE(SUM(monto_solicitado), 0) > 0
-              THEN LEAST(100, ROUND(SUM(monto_comprobado) / SUM(monto_solicitado) * 100))
+              THEN LEAST(100, ROUND((SUM(monto_comprobado) + v_dep) / SUM(monto_solicitado) * 100))
               ELSE 0 END AS pct
     FROM comprobantes_gasto
    WHERE solicitud_id = v_folio
      AND (p_solo_avion = 0 OR concepto = 'Avión');
 END$$
 
--- Folios Cerrado del usuario sin comprobar por completo. Si hay 2 o más (MAX_FOLIOS_SIN_COMPROBAR)
--- no puede generar una nueva solicitud: bloquea_nueva_solicitud = 1.
+-- Folios Cerrado del usuario sin comprobar por completo (depósitos sobrantes incluidos en lo comprobado). Si hay
+-- 2 o más (MAX_FOLIOS_SIN_COMPROBAR) no puede generar una nueva solicitud: bloquea_nueva_solicitud = 1.
 CREATE PROCEDURE sp_folios_sin_comprobar(IN p_user_id VARCHAR(40))
 BEGIN
   SELECT t.id, t.folio, t.monto_total, t.solicitado, t.comprobado,
@@ -1396,7 +1469,8 @@ BEGIN
     FROM (
       SELECT s.id, s.folio, s.monto_total,
              COALESCE(SUM(c.monto_solicitado), 0) AS solicitado,
-             COALESCE(SUM(c.monto_comprobado), 0) AS comprobado
+             COALESCE(SUM(c.monto_comprobado), 0)
+               + COALESCE((SELECT SUM(d.monto) FROM depositos_sobrante d WHERE d.solicitud_id = s.folio), 0) AS comprobado
         FROM solicitudes s
         LEFT JOIN comprobantes_gasto c ON c.solicitud_id = s.folio
        WHERE s.user_id = p_user_id AND s.estatus = 'Cerrado'

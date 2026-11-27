@@ -21,6 +21,8 @@ export type User = {
   jefe_id: string | null;
   activo: boolean;
   initials: string;
+  // false = "No Autorizado para Viajar": puede entrar al portal pero no crear solicitudes (lo habilita su jefe inmediato).
+  autorizado_viajar?: boolean;
   // Departamento cuyo presupuesto descuentan sus viajes (null = sin asignar).
   departamento_id?: number | null;
 };
@@ -114,6 +116,19 @@ export type ComprobanteGasto = {
   nota_validacion?: string;
 };
 
+// Ficha de depósito del sobrante: el viajero reintegra lo que no gastó. Tabla aparte; su monto suma al comprobado
+// del folio (sin acción a SAP por ahora). El archivo se abre con `url`.
+export type Deposito = {
+  id: string;
+  solicitud_id: string;
+  monto: number;
+  archivo: string;
+  fecha?: string; // ISO con hora
+  creado_por?: string | null;
+  creado_por_nombre?: string | null;
+  url: string;
+};
+
 export function fmtMoney(n: number): string {
   return "$" + n.toLocaleString("es-MX", { maximumFractionDigits: 0 });
 }
@@ -140,12 +155,17 @@ export function avanceComprobacion(
   comprobantes: ComprobanteGasto[],
   folio: string, // Solicitud.folio (ComprobanteGasto.solicitud_id guarda el folio)
   soloAvion = false,
+  depositos: Pick<Deposito, "solicitud_id" | "monto">[] = [],
 ) {
   const filas = comprobantes
     .filter((c) => c.solicitud_id === folio)
     .filter((c) => !soloAvion || c.concepto === "Avión");
   const solicitado = filas.reduce((a, r) => a + r.monto_solicitado, 0);
-  const comprobado = filas.reduce((a, r) => a + r.monto_comprobado, 0);
+  // El depósito sobrante suma al comprobado del folio (no aplica a la vista del gestor de vuelos).
+  const dep = soloAvion
+    ? 0
+    : depositos.filter((d) => d.solicitud_id === folio).reduce((a, d) => a + d.monto, 0);
+  const comprobado = Math.round((filas.reduce((a, r) => a + r.monto_comprobado, 0) + dep) * 100) / 100;
   const completo = solicitado > 0 && comprobado === solicitado;
   const pct = solicitado > 0 ? Math.min(100, Math.round((comprobado / solicitado) * 100)) : 0;
   return { solicitado, comprobado, completo, pct };
@@ -301,6 +321,7 @@ export type Compensacion = {
   comentario?: string;
   compensado_por: string;
   compensado_at: string; // ISO con hora
+  documento_sap?: string; // documento contable que confirmó SAP al compensar (si la contabilización estaba activa)
 };
 
 export type ResumenCompensacion = {
@@ -313,7 +334,8 @@ export type ResumenCompensacion = {
     validado: boolean;
   }[];
   solicitado: number;
-  comprobado: number;
+  comprobado: number; // incluye los depósitos sobrantes
+  depositos: number; // depósito sobrante (suma al comprobado del folio)
   facturado: number;
   excedente: number;
   comprobadoCompleto: boolean;
@@ -582,6 +604,8 @@ export type Factura = {
   // El archivo vive en la BD; se abre con `url` (GET /api/facturas/:id/archivo).
   url?: string;
   par_id?: string;
+  // Estado ante el SAT al subir el XML; "Pendiente" = el SAT no respondió y falta reverificar.
+  sat_estado?: string | null;
 };
 
 export function conceptoRequierePar(concepto: string) {

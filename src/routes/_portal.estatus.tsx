@@ -27,6 +27,7 @@ import {
   useAutorizaciones,
   useCatalogos,
   useComprobantes,
+  useDepositos,
   useConfig,
   useRevisionesMonto,
   useCompensaciones,
@@ -105,6 +106,7 @@ function Estatus() {
   const users = lista(usersData);
   const { data: comprobantesData } = useComprobantes();
   const comprobantesGasto = lista(comprobantesData);
+  const depositos = lista(useDepositos().data);
   const { data: catalogos } = useCatalogos();
   const hotelesCatalogo: Hotel[] = lista(catalogos?.hoteles);
   const { data: revisionesData } = useRevisionesMonto();
@@ -133,7 +135,7 @@ function Estatus() {
   // Mismo criterio que usa "Comprobación": comprobado solo cuando el total
   // comprobado iguala al total solicitado en todos sus renglones.
   const estaComprobado = (solicitudId: string) =>
-    avanceComprobacion(comprobantesGasto, solicitudId).completo;
+    avanceComprobacion(comprobantesGasto, solicitudId, false, depositos).completo;
   // Etiqueta que ve el usuario (Pendiente/Autorizado/Comprobado/Rechazado); el
   // valor guardado en s.estatus sigue siendo Abierto/Cerrado/Rechazado.
   const etiquetaEstatus = (s: Solicitud) => estatusVisible(s.estatus, estaComprobado(s.folio));
@@ -217,7 +219,7 @@ function Estatus() {
   }, [visibles, users]);
 
   const filtered = useMemo(() => {
-    const comprobado = (id: string) => avanceComprobacion(comprobantesGasto, id).completo;
+    const comprobado = (id: string) => avanceComprobacion(comprobantesGasto, id, false, depositos).completo;
     const validado = (id: string) => avanceValidacion(comprobantesGasto, id).completa;
     const compensados = new Set(compensaciones.map((c) => c.solicitud_id));
     return visibles.filter((s) => {

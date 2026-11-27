@@ -12,6 +12,7 @@
     "build:dev": "vite build --mode development",
     "preview": "vite preview",
     "storage:migrar": "tsx --env-file=.env.local scripts/migrar-archivos.ts",
+    "smtp:configurar": "tsx --env-file=.env.local scripts/configurar-smtp.ts",
     "db:check": "node --env-file=.env.local scripts/db-check.mjs",
     "db:setup": "node --env-file=.env.local scripts/db-setup.mjs",
     "predev:api": "node scripts/ensure-deps.mjs",

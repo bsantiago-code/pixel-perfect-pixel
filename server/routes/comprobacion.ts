@@ -3,7 +3,9 @@ import multer from "multer";
 import { z } from "zod";
 
 import { conceptoRequierePar } from "../../src/lib/store.ts";
+import { extraerDesgloseCfdi, type DesgloseCfdi } from "../../src/lib/desglose-cfdi.ts";
 import {
+  extraerDatosCfdi,
   extraerUuidCfdi,
   validarContenidoFactura,
   validarFechaFactura,
@@ -11,10 +13,13 @@ import {
 import { me, requireAuth, requirePerm } from "../auth.ts";
 import { exec, newId, one, rows, tx } from "../db.ts";
 import { bad, forbidden, HttpError, notFound } from "../http.ts";
-import { comprobanteOut, facturaOut } from "../mappers.ts";
+import { comprobanteOut, depositoOut, facturaOut } from "../mappers.ts";
+import { scopeSolicitudes } from "../scope.ts";
+import { guardarDesglose } from "../services/contabilidad.ts";
+import { consultarEstadoCfdi } from "../services/sat.ts";
 import { exigirAlcance, exigirAlcancePorFolio } from "../services/solicitudes.ts";
 import { almacenActivo, almacenDeRef, AlmacenError, mimePorNombre, type Almacen } from "../storage/index.ts";
-import { cargarListasProhibidas } from "./admin.ts";
+import { cargarListasProhibidas, loadConfig } from "./admin.ts";
 import { exigirNoCompensado } from "./compensaciones.ts";
 
 export const comprobacionRouter = Router();
@@ -75,16 +80,12 @@ comprobacionRouter.get("/facturas", async (req, res) => {
   res.json(list.map(facturaOut));
 });
 
-// Archivo (XML/PDF/foto) para abrirlo desde el navegador: del almacén externo (facturas.ruta) o, si no hay
-// ruta, del contenido guardado en la BD. Siempre pasa por la autorización de la solicitud.
-comprobacionRouter.get("/facturas/:id/archivo", async (req, res) => {
-  const f = await one<R>(
-    `SELECT f.solicitud_id, f.archivo, f.ruta, a.mime, a.contenido
-       FROM facturas f LEFT JOIN factura_archivos a ON a.factura_id = f.id WHERE f.id = ?`,
-    [req.params.id],
-  );
-  if (!f) throw notFound("El archivo no existe.");
-  await exigirAlcancePorFolio(me(req), String(f.solicitud_id));
+// Envía un archivo guardado (XML/PDF/foto/ficha de depósito): del almacén externo (`ruta`) o, si no hay ruta, del
+// contenido guardado en la BD.
+async function enviarArchivo(
+  res: import("express").Response,
+  f: R,
+) {
   let contenido: Buffer;
   let mime: string;
   if (f.ruta) {
@@ -104,6 +105,18 @@ comprobacionRouter.get("/facturas/:id/archivo", async (req, res) => {
   res.setHeader("Content-Disposition", `inline; filename*=UTF-8''${encodeURIComponent(String(f.archivo))}`);
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.send(contenido);
+}
+
+// Archivo (XML/PDF/foto) para abrirlo desde el navegador. Siempre pasa por la autorización de la solicitud.
+comprobacionRouter.get("/facturas/:id/archivo", async (req, res) => {
+  const f = await one<R>(
+    `SELECT f.solicitud_id, f.archivo, f.ruta, a.mime, a.contenido
+       FROM facturas f LEFT JOIN factura_archivos a ON a.factura_id = f.id WHERE f.id = ?`,
+    [req.params.id],
+  );
+  if (!f) throw notFound("El archivo no existe.");
+  await exigirAlcancePorFolio(me(req), String(f.solicitud_id));
+  await enviarArchivo(res, f);
 });
 
 // ───────── subir comprobante (par XML + PDF; Vales: un solo archivo) ─────────
@@ -148,6 +161,8 @@ comprobacionRouter.post(
 
     // UUID fiscal del timbre del SAT (solo comprobantes con XML; los Vales no tienen folio fiscal).
     let uuid = "";
+    let satEstado: string | null = null; // resultado de la consulta al SAT (null = no se consultó)
+    let desglose: DesgloseCfdi | null = null; // desglose contable del XML (insumo del asiento a SAP)
     // Monto del comprobante: el Total del XML (obligatorio). Los Vales aún no piden el importe al usuario y
     // conservan el monto simulado del prototipo (200–999): PENDIENTE de definir cómo capturarlo.
     let total = Math.floor(Math.random() * 800) + 200;
@@ -179,6 +194,7 @@ comprobacionRouter.post(
         throw bad("El XML no está timbrado ante el SAT (no trae el folio fiscal UUID). No se guardó el comprobante.");
       }
       uuid = leidoUuid;
+      desglose = extraerDesgloseCfdi(text);
       const previo = await xmlYaCargado(uuid);
       if (previo) throw new HttpError(409, mensajeDuplicado(uuid, previo));
       const v = validarContenidoFactura(text, await cargarListasProhibidas());
@@ -188,6 +204,23 @@ comprobacionRouter.post(
       // Antes se inventaba un monto si faltaba el Total; ahora se rechaza (todo CFDI válido lo trae).
       if (!(leido > 0)) throw bad("El XML no trae el Total de la factura. No se guardó el comprobante.");
       total = leido;
+
+      // Vigencia ante el SAT (interruptor en Configuración). Si el SAT no responde queda 'Pendiente' y se acepta.
+      const cfg = await loadConfig();
+      const datos = cfg.sat_validacion_activa === false ? null : extraerDatosCfdi(text);
+      if (datos) {
+        const sat = await consultarEstadoCfdi({ ...datos, uuid });
+        satEstado = sat.estado;
+        if (sat.estado === "Cancelado") {
+          throw new HttpError(409, "El CFDI está cancelado ante el SAT y no puede comprobarse. No se guardó el comprobante.");
+        }
+        if (sat.estado === "No Encontrado") {
+          throw new HttpError(
+            409,
+            "El SAT no encontró este CFDI (RFC, total o UUID no coinciden, o fue timbrado hace pocos minutos). Verifica el XML o intenta de nuevo más tarde. No se guardó el comprobante.",
+          );
+        }
+      }
     }
 
     // Con almacenamiento externo (Drive/carpeta) los archivos se suben antes de la transacción y la BD solo guarda
@@ -253,11 +286,16 @@ comprobacionRouter.post(
       const insertar = async (f: Express.Multer.File, tipo: string, montoAplicado: number) => {
         const id = newId("f_");
         await exec(
-          `INSERT INTO facturas (id, solicitud_id, tipo, fecha, uuid, archivo, total, status, concepto, monto_aplicado, par_id, ruta)
-           VALUES (?, ?, ?, CURDATE(), ?, ?, ?, 'Verificado', ?, ?, ?, ?)`,
-          [id, reng.solicitud_id, tipo, uuid, f.originalname, total, reng.concepto, montoAplicado, parId, refs.get(f) ?? null],
+          `INSERT INTO facturas (id, solicitud_id, tipo, fecha, uuid, archivo, total, status, concepto, monto_aplicado, par_id, ruta, sat_estado, sat_verificado_en)
+           VALUES (?, ?, ?, CURDATE(), ?, ?, ?, 'Verificado', ?, ?, ?, ?, ?, ?)`,
+          [
+            id, reng.solicitud_id, tipo, uuid, f.originalname, total, reng.concepto, montoAplicado, parId, refs.get(f) ?? null,
+            tipo === "XML" ? satEstado : null,
+            tipo === "XML" && satEstado ? new Date() : null,
+          ],
           c,
         );
+        if (tipo === "XML" && desglose) await guardarDesglose(id, desglose, c);
         // Solo en modo BD el contenido va en factura_archivos; con almacén externo no se duplica.
         if (!refs.has(f)) {
           await exec("INSERT INTO factura_archivos (factura_id, mime, contenido) VALUES (?, ?, ?)", [id, f.mimetype || "application/octet-stream", f.buffer], c);
@@ -287,6 +325,48 @@ comprobacionRouter.post(
   },
 );
 
+// ───────── reverificar con el SAT un comprobante que quedó "Pendiente" (sin volver a subirlo) ─────────
+// Vigente → queda verificado. Cancelado / No Encontrado → mismo criterio que al subir: se quita el comprobante
+// (el trigger revierte el monto) para que el usuario cargue uno válido. SAT sin respuesta → sigue Pendiente.
+comprobacionRouter.post("/comprobacion/facturas/:key/verificar-sat", requirePerm("comprobar"), async (req, res) => {
+  const auth = me(req);
+  const items = await rows<R>(
+    `SELECT f.id, f.solicitud_id, f.tipo, f.uuid, f.ruta, f.sat_estado, a.contenido
+       FROM facturas f LEFT JOIN factura_archivos a ON a.factura_id = f.id
+      WHERE f.par_id = ? OR f.id = ?`,
+    [req.params.key, req.params.key],
+  );
+  if (!items.length) throw notFound("El comprobante no existe.");
+  await exigirAlcancePorFolio(auth, String(items[0].solicitud_id));
+  await exigirNoCompensado(String(items[0].solicitud_id));
+  const xml = items.find((i) => i.tipo === "XML");
+  if (!xml) throw bad("Este comprobante no tiene XML que verificar.");
+  if (xml.sat_estado !== "Pendiente") throw new HttpError(409, "Este comprobante no está pendiente de verificación con el SAT.");
+
+  let texto: string;
+  try {
+    texto = xml.ruta
+      ? (await almacenDeRef(String(xml.ruta)).leer(String(xml.ruta))).buffer.toString("utf8")
+      : (xml.contenido as Buffer).toString("utf8");
+  } catch (e) {
+    throw aHttp(e);
+  }
+  const datos = extraerDatosCfdi(texto);
+  if (!datos) throw bad("No se pudo leer el XML guardado para verificarlo.");
+
+  const sat = await consultarEstadoCfdi({ ...datos, uuid: String(xml.uuid) });
+  if (sat.estado === "Pendiente") {
+    return res.json({ estado: "Pendiente", eliminado: false });
+  }
+  if (sat.estado === "Vigente") {
+    await exec("UPDATE facturas SET sat_estado = 'Vigente', sat_verificado_en = NOW() WHERE id = ?", [xml.id]);
+    return res.json({ estado: "Vigente", eliminado: false });
+  }
+  await tx((c) => exec("DELETE FROM facturas WHERE par_id = ? OR id = ?", [req.params.key, req.params.key], c), auth.user.id);
+  await quitarArchivos(items.map((i) => i.ruta).filter((r): r is string => typeof r === "string" && r !== ""));
+  res.json({ estado: sat.estado, eliminado: true });
+});
+
 // ───────── eliminar comprobante completo (par o archivo suelto); el trigger revierte el monto ─────────
 comprobacionRouter.delete("/comprobacion/facturas/:key", requirePerm("comprobar"), async (req, res) => {
   const auth = me(req);
@@ -298,6 +378,162 @@ comprobacionRouter.delete("/comprobacion/facturas/:key", requirePerm("comprobar"
   // Ya sin la fila en BD: los archivos físicos van a la papelera (mejor esfuerzo; un fallo no rompe la baja).
   await quitarArchivos(items.map((i) => i.ruta).filter((r): r is string => typeof r === "string" && r !== ""));
   res.json({ ok: true, eliminados: items.length });
+});
+
+// ───────── depósito sobrante (ficha de depósito) ─────────
+// El usuario reintegra lo que no gastó y sube la ficha bancaria con su monto. Por ahora no hay acción a SAP: el
+// monto suma al viático comprobado del folio (tabla aparte, no se aplica a ningún concepto). Tope = lo pendiente.
+const EXT_DEPOSITO = /\.(pdf|jpe?g|png)$/i;
+
+const redondear2 = (n: number) => Math.round(n * 100) / 100;
+
+// Depósitos de los folios dentro del alcance del usuario (alimentan avanceComprobacion en el front).
+comprobacionRouter.get("/comprobacion/depositos", async (req, res) => {
+  const sc = scopeSolicitudes(me(req), req.query.ventana !== "0" && req.query.ventana !== "false");
+  const list = await rows<R>(
+    `SELECT d.*, u.nombre AS creado_por_nombre
+       FROM depositos_sobrante d
+       JOIN solicitudes s ON s.folio = d.solicitud_id
+       LEFT JOIN usuarios u ON u.id = d.creado_por
+      WHERE ${sc.sql}
+      ORDER BY d.created_at DESC, d.id`,
+    sc.params,
+  );
+  res.json(list.map(depositoOut));
+});
+
+comprobacionRouter.post(
+  "/comprobacion/solicitudes/:id/depositos",
+  requirePerm("comprobar"),
+  upload.single("archivo"),
+  async (req, res) => {
+    const auth = me(req);
+    const solicitudId = String(req.params.id);
+    const sol = await exigirAlcance(auth, solicitudId); // la URL lleva el id interno; las tablas hijas guardan el folio
+    const folio = String(sol.folio);
+    if (sol.estatus !== "Cerrado") throw new HttpError(409, "Solo se comprueban solicitudes autorizadas.");
+    await exigirNoCompensado(folio);
+    if (auth.role.nombre === "gestor_vuelos") throw forbidden("El gestor de vuelos no registra depósitos sobrantes.");
+
+    const parsed = z.coerce.number().positive().safeParse(req.body?.monto);
+    if (!parsed.success) throw bad("Captura un monto a reintegrar mayor a cero.");
+    const monto = redondear2(parsed.data);
+    if (!(monto > 0)) throw bad("Captura un monto a reintegrar mayor a cero.");
+
+    const f = req.file;
+    if (!f) throw bad("Sube la ficha de depósito (PDF, JPG o PNG).");
+    f.originalname = Buffer.from(f.originalname, "latin1").toString("utf8");
+    if (!EXT_DEPOSITO.test(f.originalname)) throw bad("La ficha de depósito debe ser un PDF, JPG o PNG.");
+    const dup = await one(
+      `SELECT 1 FROM depositos_sobrante WHERE solicitud_id = ? AND archivo = ?
+       UNION SELECT 1 FROM facturas WHERE solicitud_id = ? AND archivo = ?`,
+      [folio, f.originalname, folio, f.originalname],
+    );
+    if (dup) throw bad(`El archivo "${f.originalname}" ya fue cargado para esta solicitud.`);
+
+    // Con almacenamiento externo el archivo se sube antes de la transacción; si ésta falla se manda a la papelera.
+    let almacen: Almacen | null;
+    try {
+      almacen = almacenActivo();
+    } catch (e) {
+      throw aHttp(e);
+    }
+    let ref: string | null = null;
+    if (almacen) {
+      try {
+        ref = await almacen.guardar({
+          sociedad: String(sol.empresa),
+          anio: String(sol.fecha).slice(0, 4),
+          folio: String(sol.folio),
+          nombre: f.originalname,
+          mime: f.mimetype || mimePorNombre(f.originalname),
+          buffer: f.buffer,
+        });
+      } catch (e) {
+        throw aHttp(e);
+      }
+    }
+
+    const id = newId("dep_");
+    try {
+      await tx(async (c) => {
+        // Se bloquean los renglones del folio para calcular el pendiente sin carreras entre depósitos y facturas.
+        const t = await one<R>(
+          `SELECT COALESCE(SUM(monto_solicitado), 0) AS solicitado, COALESCE(SUM(monto_comprobado), 0) AS comprobado
+             FROM (SELECT monto_solicitado, monto_comprobado FROM comprobantes_gasto WHERE solicitud_id = ? FOR UPDATE) x`,
+          [folio],
+          c,
+        );
+        const d = await one<R>(
+          "SELECT COALESCE(SUM(monto), 0) AS total FROM depositos_sobrante WHERE solicitud_id = ?",
+          [folio],
+          c,
+        );
+        const pendiente = redondear2(Number(t!.solicitado) - Number(t!.comprobado) - Number(d!.total));
+        if (pendiente <= 0) {
+          throw new HttpError(409, "Este folio ya está comprobado por completo; no hay sobrante que reintegrar.");
+        }
+        if (monto > pendiente) {
+          throw new HttpError(
+            409,
+            `El depósito ($${monto.toFixed(2)}) excede lo pendiente por comprobar del folio ($${pendiente.toFixed(2)}).`,
+          );
+        }
+        await exec(
+          "INSERT INTO depositos_sobrante (id, solicitud_id, monto, archivo, ruta, creado_por) VALUES (?, ?, ?, ?, ?, ?)",
+          [id, folio, monto, f.originalname, ref, auth.user.id],
+          c,
+        );
+        if (!ref) {
+          await exec(
+            "INSERT INTO deposito_archivos (deposito_id, mime, contenido) VALUES (?, ?, ?)",
+            [id, f.mimetype || mimePorNombre(f.originalname), f.buffer],
+            c,
+          );
+        }
+        await c.query("CALL sp_registrar_log(?, ?, ?, ?, ?)", [
+          "deposito_sobrante_cargado", "solicitud", solicitudId, auth.user.id,
+          JSON.stringify({ folio: sol.folio, monto, archivo: f.originalname }),
+        ]);
+      }, auth.user.id);
+    } catch (e) {
+      if (ref) await quitarArchivos([ref]);
+      throw e;
+    }
+    const r = await one<R>(
+      "SELECT d.*, u.nombre AS creado_por_nombre FROM depositos_sobrante d LEFT JOIN usuarios u ON u.id = d.creado_por WHERE d.id = ?",
+      [id],
+    );
+    res.status(201).json(depositoOut(r!));
+  },
+);
+
+comprobacionRouter.get("/comprobacion/depositos/:id/archivo", async (req, res) => {
+  const d = await one<R>(
+    `SELECT d.solicitud_id, d.archivo, d.ruta, a.mime, a.contenido
+       FROM depositos_sobrante d LEFT JOIN deposito_archivos a ON a.deposito_id = d.id WHERE d.id = ?`,
+    [req.params.id],
+  );
+  if (!d) throw notFound("El archivo no existe.");
+  await exigirAlcancePorFolio(me(req), String(d.solicitud_id));
+  await enviarArchivo(res, d);
+});
+
+comprobacionRouter.delete("/comprobacion/depositos/:id", requirePerm("comprobar"), async (req, res) => {
+  const auth = me(req);
+  const d = await one<R>("SELECT id, solicitud_id, monto, archivo, ruta FROM depositos_sobrante WHERE id = ?", [req.params.id]);
+  if (!d) throw notFound("El depósito no existe.");
+  const sol = await exigirAlcancePorFolio(auth, String(d.solicitud_id));
+  await exigirNoCompensado(String(d.solicitud_id));
+  await tx(async (c) => {
+    await exec("DELETE FROM depositos_sobrante WHERE id = ?", [req.params.id], c);
+    await c.query("CALL sp_registrar_log(?, ?, ?, ?, ?)", [
+      "deposito_sobrante_eliminado", "solicitud", String(sol.id), auth.user.id,
+      JSON.stringify({ folio: sol.folio, monto: d.monto, archivo: d.archivo }),
+    ]);
+  }, auth.user.id);
+  if (d.ruta) await quitarArchivos([String(d.ruta)]);
+  res.json({ ok: true });
 });
 
 // ───────── validación de Compras Corporativas ─────────

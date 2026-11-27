@@ -6,6 +6,7 @@ import type { PoolConnection } from "mysql2/promise";
 import { tarifaHotel, type TipoHabitacion } from "../../src/lib/store.ts";
 import type { AuthUser } from "../auth.ts";
 import { exec, newId, rows } from "../db.ts";
+import { estadoCorreoActual } from "./correo.ts";
 
 type R = Record<string, unknown>;
 
@@ -145,16 +146,8 @@ export async function crearRevisionesMontoManual(
   const correosPendientes: string[] = [];
   if (!nuevas.length) return correosPendientes;
 
-  const cfg = await rows<R>(
-    "SELECT clave, valor FROM configuracion WHERE clave IN ('notif_email_activo', 'smtp_servidor')",
-    [],
-    c,
-  );
-  const valorCfg = (k: string) => cfg.find((r) => r.clave === k)?.valor;
-  const correoActivo = valorCfg("notif_email_activo") === undefined || String(valorCfg("notif_email_activo")) !== "false";
-  const hayServidor = typeof valorCfg("smtp_servidor") === "string" && String(valorCfg("smtp_servidor")).trim() !== "";
   // omitido: correos desactivados · simulado: sin servidor SMTP · pendiente: se envía al terminar de guardar.
-  const estadoCorreo = !correoActivo ? "omitido" : hayServidor ? "pendiente" : "simulado";
+  const estadoCorreo = await estadoCorreoActual(c);
   const tipoLog = { omitido: "correo_omitido", simulado: "correo_enviado_simulado", pendiente: "correo_en_cola" }[estadoCorreo];
   const destinatarios = await rows<R>(
     `SELECT u.id, u.correo FROM usuarios u JOIN roles r ON r.id = u.rol_id

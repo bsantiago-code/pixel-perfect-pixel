@@ -17,6 +17,7 @@ import {
   useUsuarios,
   type Config,
 } from "@/lib/queries";
+import { CONCEPTOS_CONTABLES, CUENTAS_FIJAS, claveCuentaConcepto } from "@/lib/sap";
 import { showErrorDialog } from "@/components/ErrorDialog";
 import { Paginacion, usePaginacion } from "@/components/portal/Paginacion";
 import type { Sociedad, Role, CorreoSimulado } from "@/lib/store";
@@ -349,6 +350,29 @@ function Configuracion() {
           </div>
           <div className="flex items-center justify-between gap-4 rounded-lg border p-3">
             <div>
+              <div className="text-sm font-semibold">Verificar facturas con el SAT</div>
+              <div className="text-xs text-muted-foreground">
+                Al subir un XML se consulta al SAT y se rechaza el CFDI cancelado o no encontrado. Si el SAT
+                no responde, la factura se acepta y queda como pendiente de verificar.
+              </div>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={draft.sat_validacion_activa !== false}
+              aria-label="Verificar facturas con el SAT"
+              onClick={() => setDraft({ ...draft, sat_validacion_activa: draft.sat_validacion_activa === false })}
+              className="relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors"
+              style={{ background: draft.sat_validacion_activa !== false ? "var(--color-primary)" : "#ccc" }}
+            >
+              <span
+                className="inline-block h-4 w-4 transform rounded-full bg-white transition-transform"
+                style={{ transform: draft.sat_validacion_activa !== false ? "translateX(18px)" : "translateX(2px)" }}
+              />
+            </button>
+          </div>
+          <div className="flex items-center justify-between gap-4 rounded-lg border p-3">
+            <div>
               <div className="text-sm font-semibold">Bloquear autorización sin presupuesto</div>
               <div className="text-xs text-muted-foreground">
                 Si está activo, no se puede autorizar un folio que exceda el disponible del presupuesto
@@ -378,6 +402,87 @@ function Configuracion() {
               />
             </button>
           </div>
+        </div>
+        <button onClick={saveCfg} className="ckl-btn-primary mt-4">Guardar</button>
+      </div>
+
+      <div className="ckl-card p-5 lg:col-span-2">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h3 className="text-base font-semibold">Contabilización a SAP</h3>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Al compensar un viaje se envía a SAP el asiento de sus facturas: el IVA, las retenciones y los
+              importes salen del XML, y la cuenta del gasto sale del concepto del viático. Si SAP no confirma, el
+              viaje no se compensa. El folio viaja como texto, sin “#”.
+            </p>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={!!draft.sap_contabilizacion_activa}
+            aria-label="Contabilizar en SAP al compensar"
+            onClick={() => setDraft({ ...draft, sap_contabilizacion_activa: !draft.sap_contabilizacion_activa })}
+            className="relative mt-1 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors"
+            style={{ background: draft.sap_contabilizacion_activa ? "var(--color-primary)" : "#ccc" }}
+          >
+            <span
+              className="inline-block h-4 w-4 transform rounded-full bg-white transition-transform"
+              style={{ transform: draft.sap_contabilizacion_activa ? "translateX(18px)" : "translateX(2px)" }}
+            />
+          </button>
+        </div>
+        <div className="mt-4 grid gap-3 sm:grid-cols-[14rem_1fr] sm:items-end">
+          <div>
+            <label className="ckl-label" htmlFor="sap-modo">Modo de envío</label>
+            <select
+              id="sap-modo"
+              className="ckl-input"
+              value={draft.sap_modo}
+              onChange={(e) => setDraft({ ...draft, sap_modo: e.target.value === "real" ? "real" : "simulado" })}
+            >
+              <option value="simulado">Simulado (pruebas)</option>
+              <option value="real">Real (SAP)</option>
+            </select>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            En modo simulado SAP “confirma” sin enviar nada y las cuentas vacías no bloquean. En modo real se
+            exige que todas las cuentas del asiento estén capturadas y que el servidor tenga la dirección del
+            servicio de SAP (SAP_URL).
+          </p>
+        </div>
+        <div className="mt-5 text-sm font-semibold">Cuentas contables por concepto del viático</div>
+        <div className="mt-2 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+          {CONCEPTOS_CONTABLES.map((c) => (
+            <div key={c}>
+              <label className="ckl-label" htmlFor={`cta-${c}`}>{c}</label>
+              <input
+                id={`cta-${c}`}
+                className="ckl-input font-mono"
+                maxLength={30}
+                placeholder="Cuenta contable"
+                value={draft.sap_cuentas?.[claveCuentaConcepto(c)] ?? ""}
+                onChange={(e) =>
+                  setDraft({ ...draft, sap_cuentas: { ...draft.sap_cuentas, [claveCuentaConcepto(c)]: e.target.value } })
+                }
+              />
+            </div>
+          ))}
+        </div>
+        <div className="mt-5 text-sm font-semibold">Impuestos y contrapartida</div>
+        <div className="mt-2 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+          {CUENTAS_FIJAS.map((c) => (
+            <div key={c.clave}>
+              <label className="ckl-label" htmlFor={`cta-${c.clave}`}>{c.etiqueta}</label>
+              <input
+                id={`cta-${c.clave}`}
+                className="ckl-input font-mono"
+                maxLength={30}
+                placeholder="Cuenta contable"
+                value={draft.sap_cuentas?.[c.clave] ?? ""}
+                onChange={(e) => setDraft({ ...draft, sap_cuentas: { ...draft.sap_cuentas, [c.clave]: e.target.value } })}
+              />
+            </div>
+          ))}
         </div>
         <button onClick={saveCfg} className="ckl-btn-primary mt-4">Guardar</button>
       </div>

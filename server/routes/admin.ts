@@ -8,6 +8,7 @@ import {
 } from "../../src/lib/palabras-prohibidas.ts";
 import { hashPassword, me, requireAuth, requirePerm, toAuthUser } from "../auth.ts";
 import { exec, newId, one, rows, tx } from "../db.ts";
+import { CLAVES_CUENTAS } from "../../src/lib/sap.ts";
 import { bad, forbidden, HttpError, notFound } from "../http.ts";
 import { cifrarSecreto } from "../secretos.ts";
 import { almacenActivo, almacenDe, AlmacenError, driverConfigurado } from "../storage/index.ts";
@@ -94,12 +95,31 @@ export async function cargarListasProhibidas(): Promise<ListasProhibidas> {
   };
 }
 
+/** Cuentas contables de SAP: solo claves conocidas, texto corto (letras, números, . - _ /) y sin vacíos. */
+function normalizarCuentasSap(v: unknown): Record<string, string> {
+  if (!v || typeof v !== "object" || Array.isArray(v)) throw bad("Las cuentas contables deben ser un mapa de texto.");
+  const out: Record<string, string> = {};
+  for (const [k, raw] of Object.entries(v as Record<string, unknown>)) {
+    if (!CLAVES_CUENTAS.has(k)) continue;
+    if (raw === null || raw === undefined || raw === "") continue;
+    if (typeof raw !== "string") throw bad("Las cuentas contables deben ser texto.");
+    const cuenta = raw.trim();
+    if (!cuenta) continue;
+    if (!/^[A-Za-z0-9._\-/]{1,30}$/.test(cuenta)) {
+      throw bad(`La cuenta "${cuenta}" no es válida: usa hasta 30 letras, números, punto, guion o diagonal.`);
+    }
+    out[k] = cuenta;
+  }
+  return out;
+}
+
 const CONFIG_KEYS = new Set([
   "monto_comida_diario", "umbral_finanzas", "dia_deposito", "email_compras",
   "dias_comprobacion_atrasada", "dias_autorizacion_pendiente", "dias_recordatorio_viaje",
   "notif_email_activo", "notif_email_destinatarios", "smtp_servidor", "smtp_puerto", "smtp_usuario",
   "smtp_password", "smtp_cifrado", "smtp_remitente", "notif_plataforma_activo", "revision_automatica_activo",
-  "bloquear_folio_monto_hotel", "bloquear_autorizacion_sin_presupuesto", ...Object.keys(LISTAS_KEYS),
+  "bloquear_folio_monto_hotel", "bloquear_autorizacion_sin_presupuesto", "sat_validacion_activa",
+  "sap_contabilizacion_activa", "sap_modo", "sap_cuentas", ...Object.keys(LISTAS_KEYS),
 ]);
 
 adminRouter.put("/config", requirePerm("configurar_montos"), async (req, res) => {
@@ -114,8 +134,12 @@ adminRouter.put("/config", requirePerm("configurar_montos"), async (req, res) =>
         if (typeof v !== "string") throw bad("La contraseña SMTP debe ser texto.");
         if (v === "") continue; // vacío = conservar la guardada
       }
+      if (k === "sap_contabilizacion_activa" && typeof v !== "boolean") throw bad("El interruptor de contabilización debe ser sí o no.");
+      if (k === "sap_modo" && v !== "simulado" && v !== "real") throw bad("El modo de SAP debe ser simulado o real.");
       const valor =
-        k in LISTAS_KEYS
+        k === "sap_cuentas"
+          ? normalizarCuentasSap(v)
+          : k in LISTAS_KEYS
           ? normalizarListaPalabras(v)
           : k === "smtp_remitente"
             ? limpiarNombre(v)
@@ -127,6 +151,14 @@ adminRouter.put("/config", requirePerm("configurar_montos"), async (req, res) =>
         [k, JSON.stringify(valor)],
         c,
       );
+    }
+    for (const k of ["sap_contabilizacion_activa", "sap_modo", "sap_cuentas"] as const) {
+      if (k in body && JSON.stringify(antes[k] ?? null) !== JSON.stringify(k === "sap_cuentas" ? normalizarCuentasSap(body[k]) : body[k])) {
+        await c.query("CALL sp_registrar_log(?, ?, ?, ?, ?)", [
+          "config_sap", "config", k, auth.user.id,
+          JSON.stringify({ antes: antes[k] ?? null, despues: k === "sap_cuentas" ? normalizarCuentasSap(body[k]) : body[k] }),
+        ]);
+      }
     }
     if (
       "bloquear_folio_monto_hotel" in body &&
@@ -309,7 +341,7 @@ adminRouter.put("/roles/permisos", requirePerm("configurar_permisos"), async (re
 });
 
 // ───────── usuarios ─────────
-const COLS = "id, nombre, correo, rfc, rol_id, empresa, jefe_id, activo, initials, departamento_id";
+const COLS = "id, nombre, correo, rfc, rol_id, empresa, jefe_id, activo, initials, autorizado_viajar, departamento_id";
 
 adminRouter.get("/usuarios", async (_req, res) => {
   const list = await rows<R>(`SELECT ${COLS} FROM usuarios ORDER BY nombre`);
@@ -324,6 +356,8 @@ const userSchema = z.object({
   empresa: z.string().min(1),
   jefe_id: z.string().nullable().optional(),
   activo: z.boolean().default(true),
+  // false = "No Autorizado para Viajar" (no puede crear solicitudes). Sin enviarlo, no cambia.
+  autorizado_viajar: z.boolean().optional(),
   initials: z.string().default(""),
   // Departamento cuyo presupuesto descuentan sus viajes (opcional).
   departamento_id: z.number().int().nullable().optional(),
@@ -343,10 +377,10 @@ adminRouter.post("/usuarios", requirePerm("gestionar_usuarios"), async (req, res
   }
   const id = newId("u_");
   await exec(
-    `INSERT INTO usuarios (id, nombre, correo, password, rfc, rol_id, empresa, jefe_id, activo, initials, departamento_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO usuarios (id, nombre, correo, password, rfc, rol_id, empresa, jefe_id, activo, autorizado_viajar, initials, departamento_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [id, u.nombre, u.correo, await hashPassword(u.password), u.rfc, u.rol_id, u.empresa, u.jefe_id ?? null, u.activo,
-      u.initials, u.departamento_id ?? null],
+      u.autorizado_viajar ?? true, u.initials, u.departamento_id ?? null],
   );
   res.status(201).json(toAuthUser((await one<R>(`SELECT ${COLS} FROM usuarios WHERE id = ?`, [id]))!));
 });
@@ -361,6 +395,10 @@ adminRouter.put("/usuarios/:id", requirePerm("gestionar_usuarios"), async (req, 
   }
   const sets = ["nombre = ?", "correo = ?", "rfc = ?", "rol_id = ?", "empresa = ?", "jefe_id = ?", "activo = ?", "initials = ?"];
   const params: unknown[] = [u.nombre, u.correo, u.rfc, u.rol_id, u.empresa, u.jefe_id ?? null, u.activo, u.initials];
+  if (u.autorizado_viajar !== undefined) {
+    sets.push("autorizado_viajar = ?");
+    params.push(u.autorizado_viajar);
+  }
   // Sin la clave en el cuerpo (p. ej. el interruptor de Activo) se conserva el departamento actual.
   if (u.departamento_id !== undefined) {
     sets.push("departamento_id = ?");

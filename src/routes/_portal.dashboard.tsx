@@ -7,6 +7,7 @@ import {
   useCatalogos,
   useUsuarios,
   useComprobantes,
+  useDepositos,
   useConfig,
   lista,
   CONFIG_DEFAULTS,
@@ -174,6 +175,7 @@ function Dashboard() {
   const sociedades = lista(catalogos?.sociedades);
   const users = lista(usuariosData);
   const comprobantesGasto = lista(comprobantesData);
+  const depositos = lista(useDepositos(false).data);
   const mySoc = sociedades.find((s) => s.nombre === user?.empresa);
   const diasComprobacionAtrasada =
     (configData ?? CONFIG_DEFAULTS).dias_comprobacion_atrasada ?? 7;
@@ -182,7 +184,7 @@ function Dashboard() {
   // cuando el total comprobado iguala al total solicitado en todos sus
   // renglones (no basta con que se haya subido el comprobante de viaje).
   const estaComprobado = (solicitudId: string) =>
-    avanceComprobacion(comprobantesGasto, solicitudId).completo;
+    avanceComprobacion(comprobantesGasto, solicitudId, false, depositos).completo;
 
   const now = new Date();
   const inMonth = (d: string) => {

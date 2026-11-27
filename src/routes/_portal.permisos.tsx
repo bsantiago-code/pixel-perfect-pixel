@@ -30,6 +30,7 @@ const MODULOS: { key: string; label: string }[] = [
   { key: "ver_reportes", label: "Ver reportes" },
   { key: "exportar_reportes", label: "Exportar reportes" },
   { key: "gestionar_usuarios", label: "Gestionar usuarios" },
+  { key: "gestionar_preregistros", label: "Gestionar Pre-Registros (asignar jefe y recibir avisos)" },
   { key: "configurar_permisos", label: "Configurar permisos" },
   { key: "configurar_montos", label: "Configurar montos" },
 ];

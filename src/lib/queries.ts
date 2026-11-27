@@ -4,10 +4,12 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { api, reportApiError } from "./api";
 import { PALABRAS_DEFAULT } from "./palabras-prohibidas";
+import type { PayloadSap } from "./sap";
 import type {
   Autorizacion,
   Compensacion,
   ComprobanteGasto,
+  Deposito,
   ResumenCompensacion,
   Convenio,
   CorreoSimulado,
@@ -58,6 +60,12 @@ export type Config = {
   notif_plataforma_activo: boolean;
   revision_automatica_activo: boolean;
   bloquear_folio_monto_hotel: boolean;
+  sat_validacion_activa: boolean;
+  // Contabilización a SAP al compensar el viaje (apagada por omisión). Las cuentas van por clave: concepto:<Concepto>,
+  // iva_trasladado_16, iva_retenido, contrapartida… (ver CUENTAS_FIJAS en sap.ts).
+  sap_contabilizacion_activa: boolean;
+  sap_modo: "simulado" | "real";
+  sap_cuentas: Record<string, string>;
   bloquear_autorizacion_sin_presupuesto: boolean;
   palabras_prohibidas_alcohol: string[];
   palabras_prohibidas_tabaco: string[];
@@ -82,6 +90,10 @@ export const CONFIG_DEFAULTS: Config = {
   notif_plataforma_activo: true,
   revision_automatica_activo: true,
   bloquear_folio_monto_hotel: false,
+  sat_validacion_activa: true,
+  sap_contabilizacion_activa: false,
+  sap_modo: "simulado",
+  sap_cuentas: {},
   bloquear_autorizacion_sin_presupuesto: false,
   palabras_prohibidas_alcohol: PALABRAS_DEFAULT.alcohol,
   palabras_prohibidas_tabaco: PALABRAS_DEFAULT.tabaco,
@@ -119,7 +131,40 @@ export type SolicitudDetalle = {
   presupuesto?: PresupuestoFolio;
 };
 
-export type Bloqueo = { mensaje: string | null; folios: string[] };
+export type Bloqueo = { mensaje: string | null; folios: string[]; motivo?: "no_autorizado" | "folios" | null };
+
+/** Cuenta creada desde el Pre-Registro. Los datos bancarios solo llegan a quien tiene gestionar_preregistros. */
+export type Preregistro = {
+  usuario_id: string;
+  nombre: string;
+  correo: string;
+  rfc: string;
+  sociedad: string;
+  jefe_id: string | null;
+  jefe_nombre: string | null;
+  autorizado_viajar: boolean;
+  fecha: string;
+  puede_habilitar: boolean;
+  banco?: string;
+  cuenta?: string;
+  clabe?: string;
+};
+/** Sociedades del formulario de Pre-Registro (endpoint público: aún no hay sesión). */
+export const useSociedadesPublicas = () =>
+  useQuery({ queryKey: ["sociedades-publicas"], queryFn: () => api.get<{ nombre: string }[]>("/prealtas/sociedades") });
+export const usePreregistros = (enabled = true) =>
+  useQuery({
+    queryKey: ["preregistros"],
+    queryFn: () => api.get<Preregistro[]>("/preregistros"),
+    enabled,
+    refetchInterval: POLL_MS,
+  });
+export const useJefesPosibles = (enabled = true) =>
+  useQuery({
+    queryKey: ["preregistros", "jefes"],
+    queryFn: () => api.get<{ id: string; nombre: string }[]>("/preregistros/jefes"),
+    enabled,
+  });
 
 /** `ventana=false` quita el límite de 2/4 meses (p. ej. Comprobación). */
 const q = (ventana: boolean) => (ventana ? "" : "?ventana=0");
@@ -148,6 +193,13 @@ export const useAutorizaciones = (ventana = true) =>
 
 export const useComprobantes = (ventana = true) =>
   useQuery({ queryKey: ["comprobantes", ventana], queryFn: () => api.get<ComprobanteGasto[]>(`/comprobantes${q(ventana)}`) });
+
+// Fichas de depósito sobrante del alcance del usuario (suman al comprobado del folio en avanceComprobacion).
+export const useDepositos = (ventana = true) =>
+  useQuery({
+    queryKey: ["depositos", ventana],
+    queryFn: () => api.get<Deposito[]>(`/comprobacion/depositos${q(ventana)}`),
+  });
 
 export const useDestinos = (ventana = true, enabled = true) =>
   useQuery({ queryKey: ["destinos", ventana], queryFn: () => api.get<DestinoApi[]>(`/destinos${q(ventana)}`), enabled });
@@ -179,6 +231,23 @@ export const useResumenCompensacion = (solicitudId: string | null | undefined) =
       api.get<{ resumen: ResumenCompensacion; compensacion: Compensacion | null }>(
         `/solicitudes/${solicitudId}/compensacion`,
       ),
+    enabled: !!solicitudId,
+  });
+
+// Vista previa del asiento a SAP al compensar (y estado del último envío); con la contabilización apagada solo trae activo:false.
+export type VistaSap = {
+  activo: boolean;
+  modo: "simulado" | "real";
+  payload?: PayloadSap;
+  faltantes?: string[];
+  advertencias?: string[];
+  bloqueos?: string[];
+  envio: { estado: string; documento_sap: string | null; error: string | null; intentos: number; enviado_at: string | null } | null;
+};
+export const useVistaSap = (solicitudId: string | null | undefined) =>
+  useQuery({
+    queryKey: ["contabilizacion", solicitudId],
+    queryFn: () => api.get<VistaSap>(`/solicitudes/${solicitudId}/contabilizacion`),
     enabled: !!solicitudId,
   });
 

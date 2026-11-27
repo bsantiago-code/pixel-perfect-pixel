@@ -2,10 +2,10 @@ import { Link, Outlet, useLocation, useNavigate } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import {
   LayoutDashboard, FilePlus2, ListChecks, ReceiptText, BarChart3,
-  Users, ShieldCheck, Settings, Menu, Plus, X, Handshake, PiggyBank,
+  Users, ShieldCheck, Settings, Menu, Plus, X, Handshake, UserPlus, PiggyBank,
 } from "lucide-react";
 import { useAuth } from "@/lib/auth";
-import { lista, useBloqueoNuevaSolicitud, useSolicitudes } from "@/lib/queries";
+import { lista, useBloqueoNuevaSolicitud, usePreregistros, useSolicitudes } from "@/lib/queries";
 import { showErrorDialog } from "@/components/ErrorDialog";
 import { UserMenu } from "@/components/portal/UserMenu";
 import { NotificationBell } from "@/components/portal/NotificationBell";
@@ -27,10 +27,18 @@ export function PortalLayout() {
   // El servidor ya devuelve solo lo que este usuario puede ver en Estatus.
   const { data: solData } = useSolicitudes(true, { poll: true });
   const { data: bloqueoData } = useBloqueoNuevaSolicitud(sesion);
+  // Pre-Registros: Finanzas/admin asignan jefe; los jefes habilitan a sus colaboradores.
+  const gestionaPre = !!role?.permisos.gestionar_preregistros;
+  const veLaPantallaPre = gestionaPre || !!role?.permisos.autorizar_lte5000;
+  const { data: preData } = usePreregistros(sesion && veLaPantallaPre);
 
   if (!sesion || !user || !role) return null;
 
   const abiertos = lista(solData).filter((s) => s.estatus === "Abierto").length;
+  // Pendientes de atención: al jefe le toca habilitar; a Finanzas, asignar jefe a quien aún no lo tiene.
+  const pendientesPre = lista(preData).filter(
+    (p) => !p.autorizado_viajar && (p.puede_habilitar || (gestionaPre && !p.jefe_id)),
+  ).length;
 
   const items: Item[] = [
     { to: "/dashboard", label: "Dashboard", icon: LayoutDashboard, section: "General" },
@@ -41,6 +49,7 @@ export function PortalLayout() {
     { to: "/convenios", label: "Convenios", icon: Handshake, section: "Administración", perm: "gestionar_convenios" },
     { to: "/presupuestos", label: "Presupuestos", icon: PiggyBank, section: "Administración", perm: "gestionar_presupuestos" },
     { to: "/usuarios", label: "Usuarios", icon: Users, section: "Administración" },
+    { to: "/preregistros", label: "Pre-Registros", icon: UserPlus, section: "Administración", badge: pendientesPre },
     { to: "/permisos", label: "Permisos", icon: ShieldCheck, section: "Administración", perm: "configurar_permisos" },
     { to: "/configuracion", label: "Configuración", icon: Settings, section: "Administración", perm: "configurar_montos" },
   ];
@@ -49,6 +58,7 @@ export function PortalLayout() {
     // El rol Administrador no solicita ni comprueba sus propios viáticos.
     if (role.nombre === "administrador" && (i.to === "/solicitar" || i.to === "/comprobacion")) return false;
     if (i.to === "/usuarios") return role.permisos.gestionar_usuarios;
+    if (i.to === "/preregistros") return veLaPantallaPre;
     // Compras Corporativas entra a Comprobación solo para validar (no para comprobar).
     if (i.to === "/comprobacion") return role.permisos.comprobar || role.permisos.validar_comprobacion;
     if (!i.perm) return true;
@@ -109,6 +119,9 @@ export function PortalLayout() {
         <div className="min-w-0 flex-1">
           <div className="truncate text-xs font-semibold">{user.nombre}</div>
           <div className="truncate text-[10px] text-muted-foreground">{role.nombre}</div>
+          {user.autorizado_viajar === false && (
+            <div className="truncate text-[10px] font-semibold" style={{ color: "#B45309" }}>No Autorizado para Viajar</div>
+          )}
         </div>
       </div>
     </aside>
@@ -155,6 +168,14 @@ export function PortalLayout() {
           <div className="mx-0.5 hidden h-8 w-px bg-border sm:block" />
           <UserMenu />
         </header>
+        {user.autorizado_viajar === false && (
+          <div role="status" className="border-b px-4 py-2 text-xs" style={{ background: "#FFF4E5", color: "#7A4B00", borderColor: "#F5D9A8" }}>
+            <strong>Estado: No Autorizado para Viajar.</strong>{" "}
+            {bloqueoData?.motivo === "no_autorizado" && bloqueoData.mensaje
+              ? bloqueoData.mensaje
+              : "Aún no puedes crear solicitudes de viáticos hasta que tu jefe inmediato habilite tu cuenta."}
+          </div>
+        )}
         <main className="flex-1 overflow-auto p-4 md:p-6">
           <Outlet />
         </main>

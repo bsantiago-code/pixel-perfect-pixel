@@ -10,6 +10,7 @@ import {
   Search,
   ChevronDown,
   CheckCircle2,
+  RefreshCw,
 } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "@/lib/auth";
@@ -21,6 +22,7 @@ import {
   lista,
   useApiMutation,
   useComprobantes,
+  useDepositos,
   useFacturas,
   useCompensaciones,
   useSolicitudes,
@@ -32,6 +34,7 @@ import {
   avanceValidacion,
   agruparFacturas,
   conceptoRequierePar,
+  type Deposito,
   type Factura,
   type Solicitud,
   type ComprobanteGasto,
@@ -95,14 +98,16 @@ function Comprobacion() {
   const users = lista(usersData);
   const { data: comprobantesData } = useComprobantes(false);
   const comprobantes = lista(comprobantesData);
+  // Fichas de depósito sobrante de todos los folios del alcance: suman al comprobado de cada folio.
+  const depositos = lista(useDepositos(false).data);
   // El servidor ya devuelve solo los folios del alcance del rol (sin ventana de fechas).
   // El validador solo ve folios comprobados por completo (los que ya puede revisar).
   const cerradas = useMemo(
     () =>
       solicitudes
         .filter((s) => s.estatus === "Cerrado")
-        .filter((s) => !soloValidador || avanceComprobacion(comprobantes, s.folio).completo),
-    [solicitudes, comprobantes, soloValidador],
+        .filter((s) => !soloValidador || avanceComprobacion(comprobantes, s.folio, false, depositos).completo),
+    [solicitudes, comprobantes, depositos, soloValidador],
   );
   const nav = useNavigate();
   const { solicitudId } = Route.useSearch();
@@ -112,7 +117,7 @@ function Comprobacion() {
     cerradas.find((s) =>
       soloValidador
         ? !avanceValidacion(comprobantes, s.folio).completa
-        : !avanceComprobacion(comprobantes, s.folio).completo,
+        : !avanceComprobacion(comprobantes, s.folio, false, depositos).completo,
     ) ?? cerradas[0]
   )?.id ?? "";
   const [sidState, setSid] = useState<string>(() =>
@@ -120,13 +125,14 @@ function Comprobacion() {
   );
   // Si el folio guardado ya no está en el alcance del usuario, cae al de por omisión.
   const sid = cerradas.some((c) => c.id === sidState) ? sidState : porDefecto;
-  // Si la URL trae (o cambia a) un solicitudId válido, ese folio queda seleccionado.
+  // Si la URL trae (o cambia a) un solicitudId válido, ese folio queda seleccionado. Depende de `cerradas` (no solo
+  // de las solicitudes) porque para Compras la lista también espera a comprobantes y depósitos: si el folio de la URL
+  // aún no aparece cuando llegan las solicitudes, se selecciona en cuanto la lista lo incluye.
   useEffect(() => {
     if (solicitudId && cerradas.some((c) => c.id === solicitudId)) {
       setSid(solicitudId);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [solicitudId, solicitudesData]);
+  }, [solicitudId, cerradas]);
   // Selección manual: actualiza el estado y refleja el folio en la URL (sin apilar historial).
   const selectFolio = (id: string) => {
     setSid(id);
@@ -249,6 +255,41 @@ function Comprobacion() {
   );
   const removeGrupo = (g: Factura[]) => eliminarMut.mutate(g);
 
+  // Depósito sobrante: ficha bancaria + monto; suma al comprobado del folio (sin acción a SAP por ahora).
+  // solicitud_id de los depósitos = folio (como el de los renglones y facturas).
+  const depositosFolio = useMemo(() => depositos.filter((d) => d.solicitud_id === sel?.folio), [depositos, sel]);
+  const subirDepositoMut = useApiMutation(
+    (v: { solicitudId: string; fd: FormData }) =>
+      api.post<Deposito>(`/comprobacion/solicitudes/${v.solicitudId}/depositos`, v.fd),
+    { onSuccess: (d) => toast.success(`Depósito sobrante de ${fmtMoney(d.monto)} cargado y sumado al comprobado.`) },
+  );
+  const eliminarDepositoMut = useApiMutation(
+    (d: Deposito) => api.del(`/comprobacion/depositos/${d.id}`),
+    { onSuccess: () => toast.success("Depósito eliminado.") },
+  );
+
+  // Reverifica con el SAT un comprobante que quedó "SAT pendiente" (sin volver a subir los archivos).
+  const verificarSatMut = useApiMutation(
+    (g: Factura[]) =>
+      api.post<{ estado: string; eliminado: boolean }>(
+        `/comprobacion/facturas/${g[0].par_id ?? g[0].id}/verificar-sat`,
+      ),
+    {
+      onSuccess: (r) => {
+        if (r.estado === "Vigente") toast.success("El SAT confirmó que la factura está vigente.");
+        else if (r.eliminado)
+          showErrorDialog(
+            r.estado === "Cancelado"
+              ? "El CFDI está cancelado ante el SAT. Se quitó el comprobante; carga una factura vigente."
+              : "El SAT no encontró este CFDI. Se quitó el comprobante; verifica el XML y vuelve a cargarlo.",
+          );
+        else toast.info("El SAT sigue sin responder. Intenta verificar de nuevo más tarde.");
+      },
+    },
+  );
+  const verificarSat = (g: Factura[]) => verificarSatMut.mutate(g);
+  const satPendiente = (g: Factura[]) => g.some((f) => f.sat_estado === "Pendiente");
+
   if (!sel && cargandoSol)
     return (
       <div className="ckl-card p-8 text-center text-sm text-muted-foreground">Cargando…</div>
@@ -263,17 +304,18 @@ function Comprobacion() {
     );
 
   const totSol = rows.reduce((a, r) => a + r.monto_solicitado, 0);
-  const totComp = rows.reduce((a, r) => a + r.monto_comprobado, 0);
-  // Estatus global: comprobado solo cuando el total comprobado iguala al total solicitado.
+  const totDep = soloAvion ? 0 : depositosFolio.reduce((a, d) => a + d.monto, 0);
+  const totComp = Math.round((rows.reduce((a, r) => a + r.monto_comprobado, 0) + totDep) * 100) / 100;
+  // Estatus global: comprobado solo cuando el total comprobado (con depósitos) iguala al total solicitado.
   const comprobado = totSol > 0 && totComp === totSol;
 
   // Mismo criterio que "comprobado" arriba, pero para cualquier folio del
   // listado (no solo el seleccionado) — así el selector puede pintar en
   // verde los que ya están completos.
   const avanceDe = (solicitudId: string) =>
-    avanceComprobacion(comprobantes, solicitudId, soloAvion);
+    avanceComprobacion(comprobantes, solicitudId, soloAvion, depositos);
   const validacionDe = (solicitudId: string) => avanceValidacion(comprobantes, solicitudId);
-  const validacion = validacionDe(sid);
+  const validacion = validacionDe(sel.folio); // avanceValidacion recibe el FOLIO (con sid —id interno— nunca coincidía)
   const insignia = !comprobado
     ? { texto: "Pendiente de comprobar", bg: "#FEF3C7", fg: "#B45309" }
     : validacion.completa
@@ -384,6 +426,7 @@ function Comprobacion() {
       return { texto: `Incompleto · falta ${falta}`, bg: "#FEF3C7", fg: "#B45309" };
     }
     if (g.some((f) => f.status === "Error")) return { texto: "Error", bg: "#FEE9EA", fg: "#E30613" };
+    if (g.some((f) => f.sat_estado === "Pendiente")) return { texto: "SAT pendiente", bg: "#FEF3C7", fg: "#B45309" };
     return { texto: "Verificado", bg: "#D8F3DC", fg: "#2D6A4F" };
   };
   const badgeRenglon = (r: ComprobanteGasto) => (
@@ -493,6 +536,12 @@ function Comprobacion() {
               </li>
             );
           })}
+          {totDep > 0 && (
+            <li className="flex justify-between p-3 text-sm">
+              <span>Depósito sobrante</span>
+              <span className="font-semibold">{fmtMoney(totDep)}</span>
+            </li>
+          )}
           <li className="flex justify-between bg-secondary p-3 text-sm font-semibold">
             <span>Totales</span>
             <span>
@@ -536,6 +585,17 @@ function Comprobacion() {
                   </tr>
                 );
               })}
+              {totDep > 0 && (
+                <tr className="border-t">
+                  <td className="p-3">Depósito sobrante</td>
+                  <td className="p-3 text-right">—</td>
+                  <td className="p-3 text-right">{fmtMoney(totDep)}</td>
+                  <td className="p-3 text-right">—</td>
+                  <td className="p-3 text-xs text-muted-foreground" colSpan={soloValidador ? 3 : 4}>
+                    Se suma al comprobado del folio
+                  </td>
+                </tr>
+              )}
               <tr className="border-t bg-secondary font-semibold">
                 <td className="p-3">Totales</td>
                 <td className="p-3 text-right">{fmtMoney(totSol)}</td>
@@ -621,6 +681,17 @@ function Comprobacion() {
                   <span className="text-xs text-muted-foreground">
                     {f.fecha} · <b className="text-foreground">{fmtMoney(f.total)}</b>
                   </span>
+                  {puedeComprobar && !compensado && satPendiente(g) && (
+                    <button
+                      title="Verificar con SAT"
+                      aria-label="Verificar con SAT"
+                      disabled={verificarSatMut.isPending}
+                      className="rounded p-2 hover:bg-secondary disabled:opacity-50"
+                      onClick={() => verificarSat(g)}
+                    >
+                      <RefreshCw size={16} />
+                    </button>
+                  )}
                   {puedeComprobar && !compensado && (
                     <button title="Eliminar" aria-label="Eliminar comprobante" className="rounded p-2 hover:bg-secondary" onClick={() => removeGrupo(g)}>
                       <Trash2 size={16} />
@@ -696,6 +767,17 @@ function Comprobacion() {
                             </div>
                           ))}
                         </div>
+                        {puedeComprobar && !compensado && satPendiente(g) && (
+                          <button
+                            title="Verificar con SAT"
+                            aria-label="Verificar con SAT"
+                            disabled={verificarSatMut.isPending}
+                            className="rounded p-1 hover:bg-secondary disabled:opacity-50"
+                            onClick={() => verificarSat(g)}
+                          >
+                            <RefreshCw size={14} />
+                          </button>
+                        )}
                         {puedeComprobar && !compensado && (
                           <button
                             title="Eliminar"
@@ -719,37 +801,41 @@ function Comprobacion() {
         </Paginado>
       </div>
 
-      {!soloAvion && puedeComprobar && (
-        <div className="grid gap-5 lg:grid-cols-2">
-          <div className="ckl-card p-4">
-            <div className="text-sm font-semibold">No deducibles</div>
-            <div className="mt-3 grid grid-cols-3 gap-2">
-              <input className="ckl-input" placeholder="Monto" />
-              <input className="ckl-input" placeholder="Establecimiento" />
-              <input className="ckl-input" placeholder="Lugar" />
-            </div>
-            <button className="ckl-btn-outline mt-3" onClick={() => toast.success("Foto adjunta.")}>
-              <Upload size={14} /> Adjuntar foto
-            </button>
-          </div>
-          <div className="ckl-card p-4" style={{ borderLeft: "4px solid var(--color-primary)" }}>
-            <div className="text-sm font-semibold">Depósito sobrante</div>
-            <div
-              className="mt-2 rounded-md p-2 text-xs"
-              style={{ background: "#FEF3C7", color: "#D97706" }}
-            >
-              Es obligatorio reintegrar el sobrante con comprobante bancario.
-            </div>
-            <div className="mt-3 flex gap-2">
-              <input className="ckl-input" placeholder="Monto a reintegrar" />
-              <button
-                className="ckl-btn-primary"
-                onClick={() => toast.success("Comprobante bancario cargado.")}
-              >
-                <Upload size={14} /> Cargar
+      {!soloAvion && (puedeComprobar || depositosFolio.length > 0) && (
+        <div className={puedeComprobar ? "grid gap-5 lg:grid-cols-2" : "grid gap-5"}>
+          {puedeComprobar && (
+            <div className="ckl-card p-4">
+              <div className="text-sm font-semibold">No deducibles</div>
+              <div className="mt-3 grid grid-cols-3 gap-2">
+                <input className="ckl-input" placeholder="Monto" />
+                <input className="ckl-input" placeholder="Establecimiento" />
+                <input className="ckl-input" placeholder="Lugar" />
+              </div>
+              <button className="ckl-btn-outline mt-3" onClick={() => toast.success("Foto adjunta.")}>
+                <Upload size={14} /> Adjuntar foto
               </button>
             </div>
-          </div>
+          )}
+          <DepositoSobrante
+            depositos={depositosFolio}
+            pendiente={Math.max(0, Math.round((totSol - totComp) * 100) / 100)}
+            puedeCargar={puedeComprobar && !compensado}
+            cargando={subirDepositoMut.isPending || eliminarDepositoMut.isPending}
+            onCargar={async (monto, archivo) => {
+              const fd = new FormData();
+              fd.append("monto", String(monto));
+              fd.append("archivo", archivo);
+              try {
+                const d = await subirDepositoMut.mutateAsync({ solicitudId: sel.id, fd });
+                addLog(`✔ Depósito sobrante cargado: ${d.archivo} · ${fmtMoney(d.monto)}`);
+                return true;
+              } catch (e) {
+                addLog(`✖ ${e instanceof Error ? e.message : "No se pudo cargar el depósito"}`);
+                return false;
+              }
+            }}
+            onEliminar={(d) => eliminarDepositoMut.mutate(d)}
+          />
         </div>
       )}
       </div>
@@ -759,6 +845,134 @@ function Comprobacion() {
           onClose={() => setAdjuntando(null)}
           onSubir={(a) => subirComprobante(adjuntando, a)}
         />
+      )}
+    </div>
+  );
+}
+
+// Tarjeta "Depósito sobrante": el viajero reintegra lo que no gastó y sube la ficha bancaria (PDF/JPG/PNG).
+// Cada depósito suma al comprobado del folio; el tope es lo que aún falta por comprobar. Sin acción a SAP por ahora.
+function DepositoSobrante({
+  depositos,
+  pendiente,
+  puedeCargar,
+  cargando,
+  onCargar,
+  onEliminar,
+}: {
+  depositos: Deposito[];
+  pendiente: number;
+  puedeCargar: boolean;
+  cargando: boolean;
+  onCargar: (monto: number, archivo: File) => Promise<boolean>;
+  onEliminar: (d: Deposito) => void;
+}) {
+  const [monto, setMonto] = useState("");
+  const [archivo, setArchivo] = useState<File | null>(null);
+  const [claveInput, setClaveInput] = useState(0); // reinicia el <input type="file"> tras cargar
+
+  const cargar = async () => {
+    const m = Number(monto);
+    if (!(m > 0)) {
+      showErrorDialog("Captura el monto a reintegrar (mayor a cero).");
+      return;
+    }
+    if (!archivo) {
+      showErrorDialog("Selecciona la ficha de depósito (PDF, JPG o PNG).");
+      return;
+    }
+    if (!/\.(pdf|jpe?g|png)$/i.test(archivo.name)) {
+      showErrorDialog("La ficha de depósito debe ser un PDF, JPG o PNG.");
+      return;
+    }
+    if (m > pendiente) {
+      showErrorDialog(
+        pendiente > 0
+          ? `El depósito (${fmtMoney(m)}) excede lo pendiente por comprobar del folio (${fmtMoney(pendiente)}).`
+          : "Este folio ya está comprobado por completo; no hay sobrante que reintegrar.",
+      );
+      return;
+    }
+    if (await onCargar(m, archivo)) {
+      setMonto("");
+      setArchivo(null);
+      setClaveInput((k) => k + 1);
+    }
+  };
+
+  return (
+    <div className="ckl-card p-4" style={{ borderLeft: "4px solid var(--color-primary)" }}>
+      <div className="text-sm font-semibold">Depósito sobrante</div>
+      {puedeCargar && (
+        <>
+          <div className="mt-2 rounded-md p-2 text-xs" style={{ background: "#FEF3C7", color: "#D97706" }}>
+            Es obligatorio reintegrar el sobrante con comprobante bancario. El monto se suma a lo comprobado
+            {pendiente > 0 ? ` (máximo ${fmtMoney(pendiente)}, lo que falta por comprobar).` : "."}
+          </div>
+          <div className="mt-3 flex gap-2">
+            <input
+              className="ckl-input"
+              type="number"
+              inputMode="decimal"
+              min="0"
+              step="0.01"
+              placeholder="Monto a reintegrar"
+              aria-label="Monto a reintegrar"
+              value={monto}
+              onChange={(e) => setMonto(e.target.value)}
+            />
+            <button className="ckl-btn-primary shrink-0" disabled={cargando} onClick={cargar}>
+              <Upload size={14} /> Cargar
+            </button>
+          </div>
+          <input
+            key={claveInput}
+            className="ckl-input mt-2 w-full"
+            type="file"
+            accept=".pdf,.jpg,.jpeg,.png,application/pdf,image/jpeg,image/png"
+            aria-label="Ficha de depósito"
+            onChange={(e) => setArchivo(e.target.files?.[0] ?? null)}
+          />
+        </>
+      )}
+      {depositos.length > 0 ? (
+        <ul className="mt-3 divide-y text-sm">
+          {depositos.map((d) => (
+            <li key={d.id} className="flex flex-wrap items-center justify-between gap-2 py-2">
+              <div className="min-w-0">
+                <div className="font-semibold">{fmtMoney(d.monto)}</div>
+                <div className="truncate text-xs text-muted-foreground">
+                  {d.archivo}
+                  {d.fecha ? ` · ${d.fecha.slice(8, 10)}/${d.fecha.slice(5, 7)}/${d.fecha.slice(0, 4)}` : ""}
+                  {d.creado_por_nombre ? ` · ${d.creado_por_nombre}` : ""}
+                </div>
+              </div>
+              <div className="flex gap-1">
+                <button
+                  title="Ver ficha"
+                  aria-label="Ver ficha de depósito"
+                  className="rounded p-1 hover:bg-secondary"
+                  onClick={() => window.open(d.url, "_blank")}
+                >
+                  <Eye size={14} />
+                </button>
+                {puedeCargar && (
+                  <button
+                    title="Eliminar"
+                    aria-label="Eliminar depósito"
+                    disabled={cargando}
+                    className="rounded p-1 hover:bg-secondary disabled:opacity-50"
+                    onClick={() => onEliminar(d)}
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                )}
+              </div>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <div className="mt-3 text-xs text-muted-foreground">Aún no hay depósitos cargados en este folio.</div>
       )}
     </div>
   );

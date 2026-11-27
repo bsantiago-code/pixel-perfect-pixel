@@ -184,7 +184,7 @@ function Solicitar() {
   useEffect(() => {
     if (editId || !user || !bloqueoMsg) return;
     showErrorDialog(bloqueoMsg);
-    nav({ to: "/comprobacion" });
+    nav({ to: bloqueoData?.motivo === "no_autorizado" ? "/dashboard" : "/comprobacion" });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editId, user?.id, bloqueoMsg]);
 
@@ -270,9 +270,9 @@ function Solicitar() {
     const comida = diasTot * config.monto_comida_diario * personas;
     const automovil = gasolina + caseta;
     const total = comida + foraneo + local + otros + hotel + automovil;
-    // Hotel, Avión y Gasolina se pagan directo con la tarjeta corporativa: no se depositan
-    // al viajero. La caseta sí se deposita (queda dentro del total a depositar).
-    const pagoDirecto = hotel + avion + gasolina;
+    // Avión y Gasolina se pagan directo con la tarjeta corporativa: no se depositan al
+    // viajero. El hospedaje (100%) y la caseta sí se depositan (quedan en el total a depositar).
+    const pagoDirecto = avion + gasolina;
     const deposito = total - pagoDirecto;
     return {
       comida, foraneo, local, otros, hotel, avion, gasolina, caseta, automovil,
@@ -510,10 +510,10 @@ function Solicitar() {
             <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Automóvil</div>
             <div className="text-sm font-semibold">{fmtMoney(totals.automovil)}</div>
           </div>
-          <div title="Hotel + Avión + Gasolina: se pagan directo con la tarjeta corporativa y no se depositan al viajero">
+          <div title="Avión + Gasolina: se pagan directo con la tarjeta corporativa y no se depositan al viajero">
             <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Pago directo empresa</div>
             <div className="text-xl font-bold" style={{ color: "#228B22" }}>{fmtMoney(totals.pagoDirecto)}</div>
-            <div className="text-[10px] text-muted-foreground">Hotel + Avión + Gasolina</div>
+            <div className="text-[10px] text-muted-foreground">Avión + Gasolina</div>
           </div>
           <div>
             <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Total a depositar</div>

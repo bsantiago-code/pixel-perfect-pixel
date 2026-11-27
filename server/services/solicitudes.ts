@@ -57,14 +57,33 @@ const dias = (a: string, b: string) =>
 const noches = (a: string, b: string) => Math.max(0, dias(a, b) - 1);
 
 /** Mensaje de bloqueo para una solicitud nueva (≥ 2 folios Cerrados sin comprobar) o null. */
-export async function bloqueoNuevaSolicitud(userId: string): Promise<{ mensaje: string | null; folios: string[] }> {
+export type MotivoBloqueo = "no_autorizado" | "folios";
+
+export async function bloqueoNuevaSolicitud(
+  userId: string,
+): Promise<{ mensaje: string | null; folios: string[]; motivo: MotivoBloqueo | null }> {
+  // Pre-registro: la cuenta entra al portal pero no puede crear solicitudes hasta que su jefe inmediato la habilite.
+  const u = await one<{ autorizado_viajar: number; jefe_id: string | null }>(
+    "SELECT autorizado_viajar, jefe_id FROM usuarios WHERE id = ?",
+    [userId],
+  );
+  if (u && !u.autorizado_viajar) {
+    return {
+      mensaje: u.jefe_id
+        ? "Tu cuenta aún no está autorizada para viajar. Tu jefe inmediato debe habilitarla antes de que puedas crear solicitudes."
+        : "Tu cuenta aún no está autorizada para viajar. Finanzas te asignará un jefe inmediato y él habilitará tu cuenta antes de que puedas crear solicitudes.",
+      folios: [],
+      motivo: "no_autorizado",
+    };
+  }
   const [res] = (await getPool().query("CALL sp_folios_sin_comprobar(?)", [userId])) as unknown as [R[][]];
   const lista = (res[0] ?? []) as R[];
-  if (lista.length < 2) return { mensaje: null, folios: lista.map((r) => String(r.folio)) };
+  if (lista.length < 2) return { mensaje: null, folios: lista.map((r) => String(r.folio)), motivo: null };
   const folios = lista.map((r) => String(r.folio));
   return {
     mensaje: `Para generar una nueva solicitud necesitas concluir la comprobación de tus viáticos anteriores. Folios sin comprobar por completo: ${folios.join(", ")}.`,
     folios,
+    motivo: "folios",
   };
 }
 
@@ -166,7 +185,7 @@ export async function guardarSolicitud(auth: Auth, editId: string | null, raw: u
     }
   } else {
     const b = await bloqueoNuevaSolicitud(user.id);
-    if (b.mensaje) throw new HttpError(409, b.mensaje, "BLOQUEO_FOLIOS");
+    if (b.mensaje) throw new HttpError(409, b.mensaje, b.motivo === "no_autorizado" ? "NO_AUTORIZADO_VIAJAR" : "BLOQUEO_FOLIOS");
   }
   validar(input, hoyIso, catalogo);
 
